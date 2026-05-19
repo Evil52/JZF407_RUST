@@ -1,0 +1,68 @@
+[workspace]
+members = [".", "logic"]
+resolver = "2"
+
+[package]
+name = "jzf407vet6"
+version = "0.1.0"
+edition = "2021"
+authors = ["Evil"]
+
+[dependencies]
+jzf407-logic = { path = "logic" }
+heapless = "0.9"
+
+# All embedded-target-only deps — not compiled when testing natively on macOS.
+[target.'cfg(target_os = "none")'.dependencies]
+embassy-executor   = { version = "0.10", features = ["platform-cortex-m", "executor-thread"] }
+embassy-stm32      = { version = "0.6", features = [
+    "stm32f407ve",
+    "unstable-pac",
+    "time-driver-tim2",
+    "exti",
+    "memory-x",
+] }
+embassy-net        = { version = "0.9", features = ["tcp", "udp", "dhcpv4", "medium-ethernet", "proto-ipv4"] }
+embassy-time       = { version = "0.5", features = ["tick-hz-1_000"] }
+embassy-sync       = { version = "0.8" }
+embassy-futures    = { version = "0.1" }
+
+smoltcp            = { version = "0.11", default-features = false, features = [
+    "socket-tcp", "socket-udp",
+    "medium-ethernet", "proto-ipv4",
+    "socket-dhcpv4",
+] }
+
+rust-mqtt          = { version = "0.5", default-features = false, features = ["v5", "bump", "defmt", "log-level-info"] }
+
+embedded-hal       = "1.0"
+embedded-hal-async = "1.0"
+embedded-io-async  = "0.7"
+
+cortex-m           = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt        = "0.7"
+panic-persist      = { version = "0.3" }
+
+defmt              = "0.3"
+defmt-rtt          = "0.4"
+
+static_cell        = "2"
+
+[dev-dependencies]
+assert_matches = "1"
+
+[[bin]]
+name = "jzf407vet6"
+path = "src/main.rs"
+
+[profile.release]
+opt-level       = "s"
+lto             = true
+codegen-units   = 1
+debug           = 2
+overflow-checks = false
+
+[profile.dev]
+opt-level = 1
+debug     = 2
+

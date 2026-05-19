@@ -1,0 +1,11 @@
+[package]
+name = "jzf407-logic"
+version = "0.1.0"
+edition = "2021"
+authors = ["Evil"]
+
+[dependencies]
+heapless = "0.9"
+
+[dev-dependencies]
+assert_matches = "1"
