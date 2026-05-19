@@ -3,6 +3,7 @@
 
 use defmt::info;
 use embassy_executor::Spawner;
+use embassy_net::{Ipv4Address, Ipv4Cidr, StackResources, StaticConfigV4};
 use embassy_stm32::{
     bind_interrupts,
     eth::{self, PacketQueue},
@@ -16,24 +17,7 @@ use embassy_stm32::{
     uid, Config,
 };
 use static_cell::StaticCell;
-use embassy_net::{Ipv4Address, Ipv4Cidr, StackResources, StaticConfigV4};
 use {defmt_rtt as _, panic_persist as _};
-
-#[cortex_m_rt::exception]
-unsafe fn HardFault(_ef: &cortex_m_rt::ExceptionFrame) -> ! {
-    // Blink PE15 (LED3) rapidly to indicate hard fault — visible without RTT
-    use embassy_stm32::pac::{GPIOE, RCC};
-    RCC.ahb1enr().modify(|w| w.set_gpioeen(true));
-    let _ = RCC.ahb1enr().read();
-    // Set PE15 as output (MODER bits 31:30 = 01)
-    GPIOE.moder().modify(|w| w.set_moder(15, embassy_stm32::pac::gpio::vals::Moder::OUTPUT));
-    loop {
-        GPIOE.bsrr().write(|w| w.set_bs(15, true));  // set high
-        for _ in 0..500_000u32 { cortex_m::asm::nop(); }
-        GPIOE.bsrr().write(|w| w.set_br(15, true));  // set low
-        for _ in 0..500_000u32 { cortex_m::asm::nop(); }
-    }
-}
 
 mod buttons;
 mod config;
@@ -49,7 +33,7 @@ mod web;
 
 bind_interrupts!(struct Irqs {
     I2C1_EV => i2c::EventInterruptHandler<peripherals::I2C1>;
-   I2C1_ER => i2c::ErrorInterruptHandler<peripherals::I2C1>;
+    I2C1_ER => i2c::ErrorInterruptHandler<peripherals::I2C1>;
     ETH     => eth::InterruptHandler;
 });
 
@@ -61,84 +45,33 @@ static STACK_RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    // Start on HSI (default) first so RTT is working before we touch PLL
-    let p = embassy_stm32::init(Config::default());
-    info!("HSI boot OK — now configuring PLL step by step");
+    // 168 MHz from 25 MHz HSE crystal (HseMode::Oscillator confirmed working).
+    // APB1 = 42 MHz, APB2 = 84 MHz, TIM2 input = 84 MHz.
+    // tick-hz-1_000_000 → TIM2 PSC = 83 (fits in u16). Do NOT use tick-hz-1_000
+    // at 168 MHz — that would require PSC=83999 which overflows u16 and panics.
+    let mut rcc_cfg = embassy_stm32::rcc::Config::default();
+    rcc_cfg.hse = Some(Hse {
+        freq: Hertz(25_000_000),
+        mode: HseMode::Oscillator,
+    });
+    rcc_cfg.pll_src = PllSource::HSE;
+    rcc_cfg.pll = Some(Pll {
+        prediv: PllPreDiv::DIV25,
+        mul: PllMul::MUL336,
+        divp: Some(PllPDiv::DIV2), // SYSCLK = 168 MHz
+        divq: Some(PllQDiv::DIV7), // 48 MHz (USB)
+        divr: None,
+    });
+    rcc_cfg.ahb_pre = AHBPrescaler::DIV1;
+    rcc_cfg.apb1_pre = APBPrescaler::DIV4; // APB1 = 42 MHz, TIM2 = 84 MHz
+    rcc_cfg.apb2_pre = APBPrescaler::DIV2; // APB2 = 84 MHz
+    rcc_cfg.sys = Sysclk::PLL1_P;
 
-    // Manual PLL configuration via PAC to identify exact crash point
-    {
-        use embassy_stm32::pac::{FLASH, PWR, RCC};
+    let mut p_cfg = Config::default();
+    p_cfg.rcc = rcc_cfg;
+    let p = embassy_stm32::init(p_cfg);
 
-        info!("Step 1: enable PWR clock");
-        RCC.apb1enr().modify(|w| w.set_pwren(true));
-        let _ = RCC.apb1enr().read();
-
-        info!("Step 2: set VOS=Scale1");
-        PWR.cr1().modify(|w| w.set_vos(embassy_stm32::pac::pwr::vals::Vos::SCALE1));
-
-        info!("Step 3: set flash wait states to 5 (WS5)");
-        FLASH.acr().modify(|w| {
-            // LATENCY bits [3:0] = 5 (5 wait states for 168 MHz at 3.3V)
-            // Also enable prefetch, icache, dcache
-            w.0 = (w.0 & !0x0F) | 5;
-            // set PRFTEN (bit8), ICEN (bit9), DCEN (bit10)
-            w.0 |= (1 << 8) | (1 << 9) | (1 << 10);
-        });
-        // Wait for flash latency to be applied
-        while (FLASH.acr().read().0 & 0x0F) != 5 {}
-        info!("Step 3 done: FLASH_ACR = {:08x}", FLASH.acr().read().0);
-
-        info!("Step 4: configure PLL (HSI source, M=16, N=336, P=2, Q=7)");
-        // PLLCFGR: PLLSRC=HSI(0), PLLM=16, PLLN=336, PLLP=DIV2(0b00), PLLQ=7
-        // PLLCFGR layout: [5:0]=PLLM, [14:6]=PLLN, [17:16]=PLLP, [22]=PLLSRC, [27:24]=PLLQ
-        let pllcfgr_val: u32 = 16       // PLLM=16
-            | (336 << 6)                // PLLN=336
-            | (0b00 << 16)              // PLLP=DIV2
-            | (0 << 22)                 // PLLSRC=HSI
-            | (7 << 24);               // PLLQ=7
-        RCC.pllcfgr().write(|w| w.0 = pllcfgr_val);
-        info!("PLL configured: PLLCFGR = {:08x}", RCC.pllcfgr().read().0);
-
-        info!("Step 5: enable PLL");
-        RCC.cr().modify(|w| w.set_pllon(true));
-        info!("Waiting for PLLRDY...");
-        let mut count = 0u32;
-        while !RCC.cr().read().pllrdy() {
-            count += 1;
-            if count > 1_000_000 {
-                info!("PLL timeout!");
-                break;
-            }
-        }
-        if RCC.cr().read().pllrdy() {
-            info!("Step 5 done: PLL ready after {} iterations", count);
-        }
-
-        info!("Step 6: switch SYSCLK to PLL");
-        // SW bits [1:0] in RCC_CFGR: 00=HSI, 01=HSE, 10=PLL
-        RCC.cfgr().modify(|w| {
-            w.0 = (w.0 & !0x3) | 0x2; // SW=PLL
-        });
-        info!("Waiting for SWS=PLL...");
-        let mut count = 0u32;
-        while (RCC.cfgr().read().0 & (0x3 << 2)) != (0x2 << 2) {
-            count += 1;
-            if count > 1_000_000 { break; }
-        }
-        info!("Step 6 done: SYSCLK switched to PLL, count={}", count);
-
-        // Set AHB/APB prescalers
-        info!("Step 7: set bus prescalers (AHB/1, APB1/4, APB2/2)");
-        RCC.cfgr().modify(|w| {
-            w.0 = (w.0 & !0b0000_0000_1111_1111_0000_0000_0000_0000)
-                | (0b0000 << 4)   // HPRE=DIV1
-                | (0b101 << 10)   // PPRE1=DIV4
-                | (0b100 << 13);  // PPRE2=DIV2
-        });
-        info!("Step 7 done: CFGR = {:08x}", RCC.cfgr().read().0);
-    }
-
-    info!("PLL 168 MHz configured manually — SUCCESS");
+    info!("JZF407VET6 booting — 168 MHz HSE PLL OK");
     embassy_time::Timer::after(embassy_time::Duration::from_millis(100)).await;
 
     let reset_reason = fault_marker::read_and_clear();
@@ -177,9 +110,49 @@ async fn main(spawner: Spawner) {
     OUTPUTS.set(LedId::Led1, saved_state.led1);
     OUTPUTS.set(LedId::Led2, saved_state.led2);
 
-    info!("PLL test OK — looping");
-    loop {
-        embassy_time::Timer::after(embassy_time::Duration::from_secs(5)).await;
-        info!("alive at 168MHz HSI");
-    }
+    // ---- Ethernet RMII + DP83848 ----
+    // PA1=REF_CLK, PA2=MDIO, PA7=CRS_DV
+    // PB11=TX_EN, PB12=TXD0, PB13=TXD1
+    // PC1=MDC,  PC4=RXD0, PC5=RXD1
+    let raw_uid = uid::uid();
+    let mac_addr = [
+        0x02, raw_uid[0], raw_uid[1], raw_uid[2], raw_uid[3], raw_uid[4],
+    ];
+    info!(
+        "MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]
+    );
+
+    let queue = PACKET_QUEUE.init(PacketQueue::<4, 4>::new());
+
+    let eth = eth::Ethernet::new(
+        queue, p.ETH, Irqs,
+        p.PA1,  // REF_CLK
+        p.PA7,  // CRS_DV
+        p.PC4,  // RXD0
+        p.PC5,  // RXD1
+        p.PB12, // TXD0
+        p.PB13, // TXD1
+        p.PB11, // TX_EN
+        mac_addr, p.ETH_SMA, p.PA2, // MDIO
+        p.PC1,  // MDC
+    );
+
+    let [ga, gb, gc, gd] = net_cfg.gateway;
+    let net_config = embassy_net::Config::ipv4_static(StaticConfigV4 {
+        address: Ipv4Cidr::new(Ipv4Address::new(a, b, c, d), net_cfg.prefix_len),
+        gateway: Some(Ipv4Address::new(ga, gb, gc, gd)),
+        dns_servers: heapless::Vec::new(),
+    });
+
+    let resources = STACK_RESOURCES.init(StackResources::<4>::new());
+    let seed = {
+        let u = raw_uid;
+        u64::from_le_bytes([u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7]])
+    };
+    let (stack, runner) = embassy_net::new(eth, net_config, resources, seed);
+
+    spawner.spawn(net::net_task(runner).unwrap());
+    spawner.spawn(mqtt::mqtt_task(stack.clone(), net_cfg.clone(), reset_reason).unwrap());
+    spawner.spawn(web::web_task(stack, net_cfg).unwrap());
 }

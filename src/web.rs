@@ -106,9 +106,9 @@ pub async fn web_task(stack: Stack<'static>, cfg: NetworkConfig) {
     stack.wait_config_up().await;
     info!("WEB: listening on :80");
 
-    let mut rx_buf = [0u8; 1024];
-    let mut tx_buf = [0u8; 2048];
-    let mut req_buf = [0u8; 1024];
+    let mut rx_buf = [0u8; 1536];
+    let mut tx_buf = [0u8; 4096]; // HTML up to 2048 + headers ~60 bytes, needs > 2048
+    let mut req_buf = [0u8; 1536];
 
     loop {
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
@@ -142,6 +142,7 @@ pub async fn web_task(stack: Stack<'static>, cfg: NetworkConfig) {
                 let html = render_form(&cfg);
                 let _ = socket.write_all(HTTP_OK.as_bytes()).await;
                 let _ = socket.write_all(html.as_bytes()).await;
+                let _ = socket.flush().await;
             }
             ("POST", "/reboot") => {
                 let _ = socket.write_all(HTTP_OK.as_bytes()).await;
