@@ -11,6 +11,7 @@
 use embassy_stm32::gpio::Output;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
 
+#[derive(Clone, Copy)]
 pub enum LedId { Led1, Led2 }
 
 pub struct OutputPins {
@@ -62,6 +63,16 @@ impl SharedOutputs {
     pub fn get_relay(&self) -> bool {
         self.inner.try_lock().ok()
             .and_then(|g| g.as_ref().map(|p| p.relay.is_set_high()))
+            .unwrap_or(false)
+    }
+
+    /// Read actual LED pin state (active-LOW: Low = ON).
+    pub fn get_led(&self, led: LedId) -> bool {
+        self.inner.try_lock().ok()
+            .and_then(|g| g.as_ref().map(|p| match led {
+                LedId::Led1 => p.led1.is_set_low(),
+                LedId::Led2 => p.led2.is_set_low(),
+            }))
             .unwrap_or(false)
     }
 }

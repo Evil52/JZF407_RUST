@@ -1,3 +1,4 @@
+use core::sync::atomic::{AtomicBool, Ordering};
 use crate::fault_marker::ResetReason;
 use crate::outputs::LedId;
 use defmt::{error, info, warn};
@@ -24,6 +25,11 @@ use rust_mqtt::{
 /// the MQTT receive path (handle_event): the broker echoes our own publish back
 /// (we subscribe to that topic), which would loop forever. See handle_event.
 pub static RELAY_CHANGE: Signal<CriticalSectionRawMutex, bool> = Signal::new();
+
+/// True only while the MQTT client is connected to the broker. Set by mqtt_task,
+/// read by web_task for the live "MQTT" status indicator. Plain atomic — it is a
+/// single bool with no ordering requirements against other state.
+pub static MQTT_ONLINE: AtomicBool = AtomicBool::new(false);
 
 const MQTT_TOPIC_LED1: &str = "stm32/led/1";
 const MQTT_TOPIC_LED2: &str = "stm32/led/2";
@@ -74,6 +80,7 @@ pub async fn mqtt_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: 
     let diag_str = reset_reason.as_str();
 
     loop {
+        MQTT_ONLINE.store(false, Ordering::Relaxed);
         let mut socket = TcpSocket::new(stack, rx_buf, tx_buf);
         socket.set_timeout(Some(Duration::from_secs(30)));
 
@@ -109,7 +116,10 @@ pub async fn mqtt_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: 
             .will(will_opts);
 
         match client.connect(socket, &connect_opts, client_id).await {
-            Ok(_) => info!("MQTT: connected"),
+            Ok(_) => {
+                info!("MQTT: connected");
+                MQTT_ONLINE.store(true, Ordering::Relaxed);
+            }
             Err(e) => {
                 error!("MQTT: connect error {:?}, retry in 1 s", e);
                 Timer::after(Duration::from_secs(1)).await;

@@ -1,12 +1,18 @@
+use core::sync::atomic::Ordering;
+use crate::fault_marker::ResetReason;
 use defmt::{info, warn};
 use embassy_net::{tcp::TcpSocket, Stack};
 use embedded_io_async::Write;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use heapless::String as HString;
 use jzf407_logic::config::{parse_ipv4, parse_port, NetworkConfig};
 
 const HTTP_OK: &str =
     "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n";
+// JSON response for /state polling. `no-store` stops the browser caching it, so
+// each poll reflects the live pin state.
+const HTTP_OK_JSON: &str =
+    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
 const HTTP_303: &str = "HTTP/1.1 303 See Other\r\nLocation: /\r\nConnection: close\r\n\r\n";
 const HTTP_400: &str = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nBad Request";
 const HTTP_404: &str = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\nNot Found";
@@ -28,7 +34,12 @@ body{font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;background
 .pill.on{background:#dcfce7;color:#15803d}\
 .pill.off{background:#fee2e2;color:#b91c1c}\
 .dot{width:7px;height:7px;border-radius:50%;background:currentColor}\
+.leds{display:flex;gap:8px;margin-top:14px}\
 .btns{display:flex;gap:9px}\
+.kv{display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid #f1f5f9;font-size:13px}\
+.kv:last-child{border-bottom:0}\
+.k{color:#64748b;font-weight:600}\
+.v{font-weight:600;font-variant-numeric:tabular-nums}\
 button{font:inherit;font-weight:600;font-size:14px;border:0;border-radius:10px;padding:10px 20px;cursor:pointer;transition:background .15s}\
 .bon{background:#16a34a;color:#fff}\
 .boff{background:#dc2626;color:#fff}\
@@ -47,16 +58,76 @@ input:focus{outline:0;border-color:#4f46e5;background:#fff;box-shadow:0 0 0 3px 
 .reboot{width:100%;background:#fff;color:#dc2626;border:1px solid #fecaca;padding:11px}\
 </style></head><body><div class='wrap'>";
 
-const PAGE_FOOT: &str = "</div></body></html>";
+// Footer + a tiny polling script: every 1.2 s fetch /state and repaint the relay
+// and LED status pills in place, so MQTT-driven changes show without a reload.
+// No framework, no websocket — just fetch + setInterval (~350 B, flash-resident).
+const PAGE_FOOT: &str = "<script>\
+function g(i){return document.getElementById(i)}\
+function pl(i,o,t){var e=g(i);if(e){e.className='pill '+(o?'on':'off');e.innerHTML=\"<span class='dot'></span>\"+t}}\
+function tx(i,v){var e=g(i);if(e){e.textContent=v}}\
+function fu(n){var d=n/86400|0,h=n%86400/3600|0,m=n%3600/60|0,s=n%60;return (d?d+'d ':'')+(h<10?'0':'')+h+':'+(m<10?'0':'')+m+':'+(s<10?'0':'')+s}\
+function p(){fetch('/state').then(function(r){return r.json()}).then(function(s){pl('rp',s.relay,s.relay?'ON':'OFF');pl('l1',s.led1,'LED1');pl('l2',s.led2,'LED2');pl('lk',s.link,s.link?'Up':'Down');pl('mq',s.mqtt,s.mqtt?'Online':'Offline');tx('ip',s.ip);tx('rst',s.rst);tx('up',fu(s.up))}).catch(function(){})}\
+setInterval(p,1200);p();\
+</script></div></body></html>";
 
 async fn w(socket: &mut TcpSocket<'_>, s: &str) {
     let _ = socket.write_all(s.as_bytes()).await;
 }
 
+/// Stream one status pill: `<span class='pill on|off' id=...><dot>TEXT</span>`.
+/// `id` lets the client-side poller find and repaint it (see PAGE_FOOT script).
+async fn pill(socket: &mut TcpSocket<'_>, id: &str, on: bool, text: &str) {
+    w(socket, "<span class='pill ").await;
+    w(socket, if on { "on" } else { "off" }).await;
+    w(socket, "' id='").await;
+    w(socket, id).await;
+    w(socket, "'><span class='dot'></span>").await;
+    w(socket, text).await;
+    w(socket, "</span>").await;
+}
+
+/// Live state as compact JSON for the polling script, e.g.
+/// `{"relay":1,"led1":0,"led2":0,"link":1,"mqtt":1,"up":3661,"ip":"192.168.137.2","rst":"power_on"}`.
+/// Outputs are read from the physical pins (single source of truth); `up` is
+/// seconds since boot (formatted client-side). Intentionally logs nothing — it is
+/// hit ~once per second per open page, so logging here would spam the RTT.
+async fn send_state(
+    socket: &mut TcpSocket<'_>,
+    cfg: &NetworkConfig,
+    stack: Stack<'static>,
+    reset: ResetReason,
+) {
+    use core::fmt::Write as _;
+    let ip = fmt_ipv4(&cfg.ip);
+    let mut body: HString<160> = HString::new();
+    let _ = write!(
+        body,
+        "{{\"relay\":{},\"led1\":{},\"led2\":{},\"link\":{},\"mqtt\":{},\"up\":{},\"ip\":\"{}\",\"rst\":\"{}\"}}",
+        crate::OUTPUTS.get_relay() as u8,
+        crate::OUTPUTS.get_led(crate::LedId::Led1) as u8,
+        crate::OUTPUTS.get_led(crate::LedId::Led2) as u8,
+        stack.is_link_up() as u8,
+        crate::mqtt::MQTT_ONLINE.load(Ordering::Relaxed) as u8,
+        Instant::now().as_secs(),
+        ip.as_str(),
+        reset.as_str(),
+    );
+    w(socket, HTTP_OK_JSON).await;
+    w(socket, body.as_str()).await;
+    let _ = socket.flush().await;
+}
+
 /// Stream the config + relay-control page directly to the socket. Streaming in
 /// flash-resident chunks avoids building a multi-KB HTML buffer on the stack.
-async fn send_page(socket: &mut TcpSocket<'_>, cfg: &NetworkConfig) {
+async fn send_page(
+    socket: &mut TcpSocket<'_>,
+    cfg: &NetworkConfig,
+    stack: Stack<'static>,
+    reset: ResetReason,
+) {
     let relay_on = crate::OUTPUTS.get_relay();
+    let led1_on = crate::OUTPUTS.get_led(crate::LedId::Led1);
+    let led2_on = crate::OUTPUTS.get_led(crate::LedId::Led2);
     let ip = fmt_ipv4(&cfg.ip);
     let gw = fmt_ipv4(&cfg.gateway);
     let bk = fmt_ipv4(&cfg.broker_ip);
@@ -66,14 +137,28 @@ async fn send_page(socket: &mut TcpSocket<'_>, cfg: &NetworkConfig) {
     w(socket, HTTP_OK).await;
     w(socket, PAGE_HEAD).await;
 
-    // Header + relay control
+    // Header + live status. The pill ids (rp/l1/l2) are the hooks the polling
+    // script repaints; initial classes below just avoid a flash before first poll.
     w(socket, "<div class='card'><div class='hd'><h1>JZF407VET6 Controller</h1><p>STM32F407 · Embassy · MQTT</p></div><div class='bd'><div class='relay'><div><div class='lbl'>Relay</div>").await;
-    if relay_on {
-        w(socket, "<span class='pill on'><span class='dot'></span>ON</span>").await;
-    } else {
-        w(socket, "<span class='pill off'><span class='dot'></span>OFF</span>").await;
-    }
-    w(socket, "</div><div class='btns'><form method='post' action='/relay/on'><button class='bon'>ON</button></form><form method='post' action='/relay/off'><button class='boff'>OFF</button></form></div></div></div></div>").await;
+    pill(socket, "rp", relay_on, if relay_on { "ON" } else { "OFF" }).await;
+    w(socket, "</div><div class='btns'><form method='post' action='/relay/on'><button class='bon'>ON</button></form><form method='post' action='/relay/off'><button class='boff'>OFF</button></form></div></div><div class='leds'>").await;
+    pill(socket, "l1", led1_on, "LED1").await;
+    pill(socket, "l2", led2_on, "LED2").await;
+    w(socket, "</div></div></div>").await;
+
+    // Live telemetry card. lk/mq are pills; ip/up/rst are text repainted by the
+    // poller. Initial values are real (except uptime, which the first poll fills).
+    let link_up = stack.is_link_up();
+    let mqtt_up = crate::mqtt::MQTT_ONLINE.load(Ordering::Relaxed);
+    w(socket, "<div class='card'><div class='bd'><div class='sec first'>Status</div><div class='kv'><span class='k'>Link</span>").await;
+    pill(socket, "lk", link_up, if link_up { "Up" } else { "Down" }).await;
+    w(socket, "</div><div class='kv'><span class='k'>MQTT</span>").await;
+    pill(socket, "mq", mqtt_up, if mqtt_up { "Online" } else { "Offline" }).await;
+    w(socket, "</div><div class='kv'><span class='k'>IP</span><span class='v' id='ip'>").await;
+    w(socket, ip.as_str()).await;
+    w(socket, "</span></div><div class='kv'><span class='k'>Uptime</span><span class='v' id='up'>—</span></div><div class='kv'><span class='k'>Last reset</span><span class='v' id='rst'>").await;
+    w(socket, reset.as_str()).await;
+    w(socket, "</span></div></div></div>").await;
 
     // Config form
     w(socket, "<div class='card'><div class='bd'><form method='post' action='/save'><div class='sec first'>Network</div><label>IP address</label><input type='text' name='ip' value='").await;
@@ -129,7 +214,7 @@ fn push_u16_dec<const N: usize>(buf: &mut HString<N>, v: u16) {
 }
 
 #[embassy_executor::task]
-pub async fn web_task(stack: Stack<'static>, cfg: NetworkConfig) {
+pub async fn web_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: ResetReason) {
     info!("WEB: waiting for link...");
     stack.wait_link_up().await;
     info!("WEB: link up");
@@ -172,7 +257,10 @@ pub async fn web_task(stack: Stack<'static>, cfg: NetworkConfig) {
 
         match (method, path) {
             ("GET", "/") => {
-                send_page(&mut socket, &cfg).await;
+                send_page(&mut socket, &cfg, stack, reset_reason).await;
+            }
+            ("GET", "/state") => {
+                send_state(&mut socket, &cfg, stack, reset_reason).await;
             }
             ("POST", "/relay/on") | ("POST", "/relay/off") => {
                 let on = path.ends_with("on");
