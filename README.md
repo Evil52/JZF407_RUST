@@ -1,3 +1,7 @@
+<img width="1280" height="964" alt="5220009269544033595" src="https://github.com/user-attachments/assets/3b42ccd4-64f0-4958-8391-096231b77592" />
+
+[JZ-F407VET6.pdf](https://github.com/user-attachments/files/28059060/JZ-F407VET6.pdf)
+
 # JZF407VET6 — Rust + Embassy MQTT Controller
 
 Industrial LED/relay controller on the **JZ-F407VET6** module
