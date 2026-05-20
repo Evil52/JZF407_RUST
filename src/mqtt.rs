@@ -15,7 +15,7 @@ use rust_mqtt::{
         Client,
     },
     config::KeepAlive,
-    types::{MqttBinary, MqttString, QoS, TopicFilter, TopicName},
+    types::{MqttBinary, MqttString, TopicFilter, TopicName},
     Bytes,
 };
 
@@ -44,12 +44,18 @@ const SUBSCRIBE_TOPICS: &[&str] = &[
 
 #[embassy_executor::task]
 pub async fn mqtt_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: ResetReason) {
+    info!("MQTT: waiting for link...");
+    stack.wait_link_up().await;
+    info!("MQTT: link up, waiting for config...");
     stack.wait_config_up().await;
     info!("MQTT: network up");
 
-    let mut rx_buf = [0u8; 1536];
-    let mut tx_buf = [0u8; 1536];
-    let mut mqtt_buf = [0u8; 2048];
+    static RX_BUF: static_cell::StaticCell<[u8; 1536]> = static_cell::StaticCell::new();
+    static TX_BUF: static_cell::StaticCell<[u8; 1536]> = static_cell::StaticCell::new();
+    static MQTT_BUF: static_cell::StaticCell<[u8; 2048]> = static_cell::StaticCell::new();
+    let rx_buf = RX_BUF.init([0u8; 1536]);
+    let tx_buf = TX_BUF.init([0u8; 1536]);
+    let mqtt_buf: &'static mut [u8; 2048] = MQTT_BUF.init([0u8; 2048]);
 
     let [ba, bb, bc, bd] = cfg.broker_ip;
     let broker_addr = embassy_net::IpEndpoint::new(
@@ -65,17 +71,21 @@ pub async fn mqtt_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: 
     let diag_str = reset_reason.as_str();
 
     loop {
-        let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
+        let mut socket = TcpSocket::new(stack, rx_buf, tx_buf);
         socket.set_timeout(Some(Duration::from_secs(30)));
 
-        info!("MQTT: connecting to broker {}:{}", ba, cfg.broker_port);
+        info!(
+            "MQTT: connecting to broker {}.{}.{}.{}:{}",
+            ba, bb, bc, bd, cfg.broker_port
+        );
         if socket.connect(broker_addr).await.is_err() {
             warn!("MQTT: TCP connect failed, retry in 1 s");
             Timer::after(Duration::from_secs(1)).await;
             continue;
         }
 
-        let mut bump = BumpBuffer::new(&mut mqtt_buf);
+        mqtt_buf.fill(0);
+        let mut bump = BumpBuffer::new(mqtt_buf);
 
         // Client<'_, N, B, MAX_SUBSCRIBES, RECEIVE_MAX, SEND_MAX, MAX_SUB_IDS>
         let mut client = Client::<'_, _, _, 8, 4, 4, 1>::new(&mut bump);
@@ -213,20 +223,34 @@ where
         dispatch_special(topic)
     }) {
         match cmd {
-            OutputCmd::Led1(on) => crate::OUTPUTS.set(LedId::Led1, on),
-            OutputCmd::Led2(on) => crate::OUTPUTS.set(LedId::Led2, on),
+            OutputCmd::Led1(on) => {
+                crate::OUTPUTS.set(LedId::Led1, on);
+                crate::persistence::save_led1(on).await;
+            }
+            OutputCmd::Led2(on) => {
+                crate::OUTPUTS.set(LedId::Led2, on);
+                crate::persistence::save_led2(on).await;
+            }
             OutputCmd::AllLeds(on) => {
                 crate::OUTPUTS.set(LedId::Led1, on);
                 crate::OUTPUTS.set(LedId::Led2, on);
+                crate::persistence::save_leds(on, on).await;
             }
-            OutputCmd::Relay(on) => RELAY_CHANGE.signal(on),
+            OutputCmd::Relay(on) => {
+                // Drive the shared relay directly. Do NOT signal RELAY_CHANGE here:
+                // that signal triggers a publish to stm32/relay, which the broker
+                // would echo back to us (we subscribe to it) and loop forever.
+                crate::OUTPUTS.set_relay(on);
+                crate::persistence::save_relay(on).await;
+            }
             OutputCmd::Ping => {
                 // Reply with pong for RTT measurement
                 let _ = publish_qos0(client, MQTT_TOPIC_PONG, b"1").await;
             }
             OutputCmd::Reboot => {
+                defmt::warn!("MQTT: reboot command received, resetting");
                 crate::fault_marker::mark_remote_reboot();
-                cortex_m::peripheral::SCB::sys_reset();
+                crate::fault_marker::safe_reboot();
             }
             OutputCmd::Unknown => {}
         }

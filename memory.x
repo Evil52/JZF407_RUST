@@ -6,12 +6,13 @@ MEMORY
     CCMRAM : ORIGIN = 0x10000000, LENGTH = 64K
 }
 
-/* panic-persist region: last 256 bytes of CCMRAM, preserved across soft resets */
-_panic_dump_start = ORIGIN(CCMRAM) + LENGTH(CCMRAM) - 256;
-_panic_dump_end   = ORIGIN(CCMRAM) + LENGTH(CCMRAM);
-
-/* fault_marker word at 0x1000FFF0 (same address as C version) */
+/* fault_marker word at 0x1000FFF0 (same address as C version): top 16 bytes of CCM */
 _fault_marker = 0x1000FFF0;
+
+/* panic-persist region: 240 bytes ending just below the fault_marker so a panic
+   dump can never clobber the reset-reason marker (they used to overlap). */
+_panic_dump_start = ORIGIN(CCMRAM) + LENGTH(CCMRAM) - 256;
+_panic_dump_end   = _fault_marker;
 
 SECTIONS
 {

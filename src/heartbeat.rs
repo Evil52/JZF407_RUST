@@ -9,8 +9,8 @@ pub async fn heartbeat_led_task(mut led3: Output<'static>) {
     loop {
         // Flash: LOW = on for 100ms, off for 6.9s = 7s cycle
         led3.set_low();
-        Timer::after(Duration::from_millis(500)).await;
+        Timer::after(Duration::from_millis(100)).await;
         led3.set_high();
-        Timer::after(Duration::from_millis(3_900)).await;
+        Timer::after(Duration::from_millis(100)).await;
     }
 }

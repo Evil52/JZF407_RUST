@@ -5,66 +5,97 @@ use embassy_time::{Duration, Timer};
 use heapless::String as HString;
 use jzf407_logic::config::{parse_ipv4, parse_port, NetworkConfig};
 
-const HTTP_OK: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
+const HTTP_OK: &str =
+    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n";
+const HTTP_303: &str = "HTTP/1.1 303 See Other\r\nLocation: /\r\nConnection: close\r\n\r\n";
 const HTTP_400: &str = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nBad Request";
 const HTTP_404: &str = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\nNot Found";
 
-/// Render HTML form with current config values.
-fn render_form(cfg: &NetworkConfig) -> HString<2048> {
-    let mut h: HString<2048> = HString::new();
+const PAGE_HEAD: &str = "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>\
+<meta name='viewport' content='width=device-width,initial-scale=1'><title>JZF407VET6</title>\
+<style>\
+*{box-sizing:border-box;margin:0;padding:0}\
+body{font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;background:#eef2f6;color:#1e293b;line-height:1.5;padding:24px 16px}\
+.wrap{max-width:460px;margin:0 auto}\
+.card{background:#fff;border-radius:16px;box-shadow:0 4px 24px rgba(15,23,42,.08);margin-bottom:18px;overflow:hidden}\
+.hd{background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;padding:22px 24px}\
+.hd h1{font-size:19px;font-weight:600}\
+.hd p{font-size:12px;opacity:.85;margin-top:3px}\
+.bd{padding:22px 24px}\
+.relay{display:flex;align-items:center;justify-content:space-between;gap:14px}\
+.relay .lbl{font-size:14px;font-weight:600}\
+.pill{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:700;padding:5px 12px;border-radius:999px;margin-top:4px}\
+.pill.on{background:#dcfce7;color:#15803d}\
+.pill.off{background:#fee2e2;color:#b91c1c}\
+.dot{width:7px;height:7px;border-radius:50%;background:currentColor}\
+.btns{display:flex;gap:9px}\
+button{font:inherit;font-weight:600;font-size:14px;border:0;border-radius:10px;padding:10px 20px;cursor:pointer;transition:background .15s}\
+.bon{background:#16a34a;color:#fff}\
+.boff{background:#dc2626;color:#fff}\
+.sec{font-size:11px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;margin:18px 0 8px}\
+.sec.first{margin-top:0}\
+label{display:block;font-size:12px;font-weight:600;color:#64748b;margin:12px 0 5px}\
+input[type=text],input[type=number]{width:100%;font:inherit;font-size:15px;padding:10px 12px;border:1px solid #cbd5e1;border-radius:10px;background:#f8fafc}\
+input:focus{outline:0;border-color:#4f46e5;background:#fff;box-shadow:0 0 0 3px rgba(79,70,229,.15)}\
+.row{display:flex;gap:12px}\
+.row>div{flex:1}\
+.chk{display:flex;align-items:center;gap:9px;margin-top:16px}\
+.chk input{width:18px;height:18px;accent-color:#4f46e5}\
+.chk label{margin:0;font-size:14px;color:#1e293b}\
+.save{width:100%;background:#4f46e5;color:#fff;margin-top:20px;padding:12px}\
+.foot{padding:16px 24px;border-top:1px solid #eef2f6}\
+.reboot{width:100%;background:#fff;color:#dc2626;border:1px solid #fecaca;padding:11px}\
+</style></head><body><div class='wrap'>";
+
+const PAGE_FOOT: &str = "</div></body></html>";
+
+async fn w(socket: &mut TcpSocket<'_>, s: &str) {
+    let _ = socket.write_all(s.as_bytes()).await;
+}
+
+/// Stream the config + relay-control page directly to the socket. Streaming in
+/// flash-resident chunks avoids building a multi-KB HTML buffer on the stack.
+async fn send_page(socket: &mut TcpSocket<'_>, cfg: &NetworkConfig) {
+    let st = crate::persistence::current_state();
     let ip = fmt_ipv4(&cfg.ip);
     let gw = fmt_ipv4(&cfg.gateway);
     let bk = fmt_ipv4(&cfg.broker_ip);
     let port = fmt_u16(cfg.broker_port);
     let prefix = fmt_u8(cfg.prefix_len);
-    let dhcp_checked = if cfg.dhcp { " checked" } else { "" };
 
-    // Build HTML by parts — avoiding literal & in strings
-    let _ = h.push_str("<!DOCTYPE html><html><head><title>JZF407VET6</title>");
-    let _ = h.push_str("<style>body{font:14px monospace;max-width:420px;margin:2em auto;border:1px solid #ccc;padding:1em}label{display:block;margin-top:0.8em}input{margin-bottom:0.4em}</style>");
-    let _ = h.push_str("</head><body><h2>JZF407VET6</h2>");
-    let _ = h.push_str("<form method=POST action=/save>");
+    w(socket, HTTP_OK).await;
+    w(socket, PAGE_HEAD).await;
 
-    // IP
-    let _ = h.push_str("<label>IP:</label><input name=ip size=16 value='");
-    let _ = h.push_str(ip.as_str());
-    let _ = h.push_str("'>");
+    // Header + relay control
+    w(socket, "<div class='card'><div class='hd'><h1>JZF407VET6 Controller</h1><p>STM32F407 · Embassy · MQTT</p></div><div class='bd'><div class='relay'><div><div class='lbl'>Relay</div>").await;
+    if st.relay {
+        w(socket, "<span class='pill on'><span class='dot'></span>ON</span>").await;
+    } else {
+        w(socket, "<span class='pill off'><span class='dot'></span>OFF</span>").await;
+    }
+    w(socket, "</div><div class='btns'><form method='post' action='/relay/on'><button class='bon'>ON</button></form><form method='post' action='/relay/off'><button class='boff'>OFF</button></form></div></div></div></div>").await;
 
-    // Prefix
-    let _ = h.push_str("<label>Prefix:</label><input name=prefix size=4 value='");
-    let _ = h.push_str(prefix.as_str());
-    let _ = h.push_str("'>");
+    // Config form
+    w(socket, "<div class='card'><div class='bd'><form method='post' action='/save'><div class='sec first'>Network</div><label>IP address</label><input type='text' name='ip' value='").await;
+    w(socket, ip.as_str()).await;
+    w(socket, "'><div class='row'><div><label>Prefix</label><input type='number' name='prefix' value='").await;
+    w(socket, prefix.as_str()).await;
+    w(socket, "'></div><div><label>Gateway</label><input type='text' name='gw' value='").await;
+    w(socket, gw.as_str()).await;
+    w(socket, "'></div></div><div class='sec'>MQTT Broker</div><div class='row'><div><label>Broker IP</label><input type='text' name='broker' value='").await;
+    w(socket, bk.as_str()).await;
+    w(socket, "'></div><div><label>Port</label><input type='number' name='port' value='").await;
+    w(socket, port.as_str()).await;
+    w(socket, "'></div></div><label>Client ID</label><input type='text' name='id' value='").await;
+    w(socket, cfg.client_id.as_str()).await;
+    w(socket, "'><div class='chk'><input type='checkbox' id='dhcp' name='dhcp' value='1'").await;
+    if cfg.dhcp {
+        w(socket, " checked").await;
+    }
+    w(socket, "><label for='dhcp'>Enable DHCP</label></div><button class='save'>Save Settings</button></form></div><div class='foot'><form method='post' action='/reboot'><button class='reboot'>Reboot Device</button></form></div></div>").await;
 
-    // Gateway
-    let _ = h.push_str("<label>Gateway:</label><input name=gw size=16 value='");
-    let _ = h.push_str(gw.as_str());
-    let _ = h.push_str("'>");
-
-    // Broker
-    let _ = h.push_str("<label>Broker:</label><input name=broker size=16 value='");
-    let _ = h.push_str(bk.as_str());
-    let _ = h.push_str("'>");
-
-    // Port
-    let _ = h.push_str("<label>Port:</label><input name=port size=6 value='");
-    let _ = h.push_str(port.as_str());
-    let _ = h.push_str("'>");
-
-    // Client ID
-    let _ = h.push_str("<label>ID:</label><input name=id size=24 value='");
-    let _ = h.push_str(cfg.client_id.as_str());
-    let _ = h.push_str("'>");
-
-    // DHCP
-    let _ = h.push_str("<label>DHCP:</label><input type=checkbox name=dhcp value=1");
-    let _ = h.push_str(dhcp_checked);
-    let _ = h.push_str(">");
-
-    let _ = h.push_str("<br><input type=submit value=Save>");
-    let _ = h.push_str("</form><form method=POST action=/reboot>");
-    let _ = h.push_str("<input type=submit value=Reboot></form>");
-    let _ = h.push_str("</body></html>");
-    h
+    w(socket, PAGE_FOOT).await;
+    let _ = socket.flush().await;
 }
 
 fn fmt_ipv4(addr: &[u8; 4]) -> HString<16> {
@@ -103,15 +134,21 @@ fn push_u16_dec<const N: usize>(buf: &mut HString<N>, v: u16) {
 
 #[embassy_executor::task]
 pub async fn web_task(stack: Stack<'static>, cfg: NetworkConfig) {
+    info!("WEB: waiting for link...");
+    stack.wait_link_up().await;
+    info!("WEB: link up");
     stack.wait_config_up().await;
     info!("WEB: listening on :80");
 
-    let mut rx_buf = [0u8; 1536];
-    let mut tx_buf = [0u8; 4096]; // HTML up to 2048 + headers ~60 bytes, needs > 2048
-    let mut req_buf = [0u8; 1536];
+    static RX_BUF: static_cell::StaticCell<[u8; 1536]> = static_cell::StaticCell::new();
+    static TX_BUF: static_cell::StaticCell<[u8; 4096]> = static_cell::StaticCell::new();
+    static REQ_BUF: static_cell::StaticCell<[u8; 1536]> = static_cell::StaticCell::new();
+    let rx_buf = RX_BUF.init([0u8; 1536]);
+    let tx_buf = TX_BUF.init([0u8; 4096]);
+    let req_buf = REQ_BUF.init([0u8; 1536]);
 
     loop {
-        let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
+        let mut socket = TcpSocket::new(stack, rx_buf, tx_buf);
         socket.set_timeout(Some(Duration::from_secs(10)));
 
         if socket.accept(80).await.is_err() {
@@ -119,7 +156,7 @@ pub async fn web_task(stack: Stack<'static>, cfg: NetworkConfig) {
             continue;
         }
 
-        let n = match socket.read(&mut req_buf).await {
+        let n = match socket.read(req_buf).await {
             Ok(n) if n > 0 => n,
             _ => continue,
         };
@@ -139,19 +176,28 @@ pub async fn web_task(stack: Stack<'static>, cfg: NetworkConfig) {
 
         match (method, path) {
             ("GET", "/") => {
-                let html = render_form(&cfg);
-                let _ = socket.write_all(HTTP_OK.as_bytes()).await;
-                let _ = socket.write_all(html.as_bytes()).await;
+                send_page(&mut socket, &cfg).await;
+            }
+            ("POST", "/relay/on") | ("POST", "/relay/off") => {
+                let on = path.ends_with("on");
+                crate::OUTPUTS.set_relay(on);
+                crate::persistence::save_relay(on).await;
+                // Tell mqtt_task to publish the new state to the broker.
+                crate::mqtt::RELAY_CHANGE.signal(on);
+                info!("WEB: relay {}", if on { "ON" } else { "OFF" });
+                let _ = socket.write_all(HTTP_303.as_bytes()).await;
                 let _ = socket.flush().await;
             }
             ("POST", "/reboot") => {
                 let _ = socket.write_all(HTTP_OK.as_bytes()).await;
                 let _ = socket
-                    .write_all(b"<html><body><p>Rebooting</p></body></html>")
+                    .write_all(b"<html><head><meta http-equiv=refresh content='4;url=/'></head><body><p>Rebooting... <a href=/>back in 4s</a></p></body></html>")
                     .await;
                 let _ = socket.flush().await;
-                Timer::after(Duration::from_millis(500)).await;
-                cortex_m::peripheral::SCB::sys_reset();
+                socket.close();
+                Timer::after(Duration::from_millis(300)).await;
+                warn!("WEB: /reboot triggered sys_reset");
+                crate::fault_marker::safe_reboot();
             }
             ("POST", "/save") => {
                 if let Some(body) = req.find("\r\n\r\n").map(|i| &req[i + 4..]) {
@@ -159,14 +205,16 @@ pub async fn web_task(stack: Stack<'static>, cfg: NetworkConfig) {
                         Some(new_cfg) => {
                             let _ = socket.write_all(HTTP_OK.as_bytes()).await;
                             let _ = socket
-                                .write_all(b"<html><body><p>Saved. Rebooting</p></body></html>")
+                                .write_all(b"<html><head><meta http-equiv=refresh content='4;url=/'></head><body><p>Saved. Rebooting... <a href=/>back in 4s</a></p></body></html>")
                                 .await;
                             let _ = socket.flush().await;
+                            socket.close();
                             Timer::after(Duration::from_millis(200)).await;
                             if crate::config::save_config(&new_cfg).await.is_err() {
                                 warn!("WEB: save failed");
                             }
-                            cortex_m::peripheral::SCB::sys_reset();
+                            warn!("WEB: /save triggered sys_reset");
+                            crate::fault_marker::safe_reboot();
                         }
                         None => {
                             let _ = socket.write_all(HTTP_400.as_bytes()).await;
@@ -231,10 +279,9 @@ fn url_decode(s: &str) -> HString<64> {
         } else if c == b'%' && i + 2 < bytes.len() {
             if let (Some(h), Some(l)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
                 let byte = (h << 4) | l;
-                if let Ok(ch) = core::str::from_utf8(&buffer(&[byte])[..]) {
-                    for cc in ch.chars() {
-                        let _ = out.push(cc);
-                    }
+                // Only single-byte UTF-8 (ASCII) is representable here; matches prior behavior.
+                if byte < 0x80 {
+                    let _ = out.push(byte as char);
                 }
                 i += 3;
             } else {
@@ -247,10 +294,6 @@ fn url_decode(s: &str) -> HString<64> {
         }
     }
     out
-}
-
-fn buffer<const N: usize>(data: &[u8; N]) -> [u8; N] {
-    *data
 }
 
 fn hex_digit(b: u8) -> Option<u8> {

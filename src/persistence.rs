@@ -54,14 +54,48 @@ pub fn load_state() -> OutputState {
     state
 }
 
-/// Save state to EEPROM asynchronously (write-when-dirty).
-pub async fn save_state_if_dirty(state: OutputState) {
-    let mut guard = STATE_CACHE.lock().await;
-    if guard.as_ref() == Some(&state) {
+/// Snapshot of the current cached output state (for display). Returns default
+/// if the cache is momentarily locked or uninitialised.
+pub fn current_state() -> OutputState {
+    STATE_CACHE
+        .try_lock()
+        .ok()
+        .and_then(|g| *g)
+        .unwrap_or_default()
+}
+
+pub async fn save_relay(on: bool) {
+    save_field(|s| s.relay = on).await;
+}
+
+pub async fn save_led1(on: bool) {
+    save_field(|s| s.led1 = on).await;
+}
+
+pub async fn save_led2(on: bool) {
+    save_field(|s| s.led2 = on).await;
+}
+
+pub async fn save_leds(led1: bool, led2: bool) {
+    save_field(|s| {
+        s.led1 = led1;
+        s.led2 = led2;
+    })
+    .await;
+}
+
+/// Apply a field update to the cached state and flush to EEPROM only if it
+/// actually changed. Each caller knows just its own output (relay or LEDs);
+/// the cache holds the full state so a partial update never clobbers siblings.
+async fn save_field(update: impl FnOnce(&mut OutputState)) {
+    let mut cache = STATE_CACHE.lock().await;
+    let mut state = (*cache).unwrap_or_default();
+    update(&mut state);
+    if *cache == Some(state) {
         return;
     }
-    *guard = Some(state);
-    drop(guard);
+    *cache = Some(state);
+    drop(cache);
 
     let buf: [u8; 8] = [
         MAGIC[0],
