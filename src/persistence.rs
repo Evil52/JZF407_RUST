@@ -54,16 +54,6 @@ pub fn load_state() -> OutputState {
     state
 }
 
-/// Snapshot of the current cached output state (for display). Returns default
-/// if the cache is momentarily locked or uninitialised.
-pub fn current_state() -> OutputState {
-    STATE_CACHE
-        .try_lock()
-        .ok()
-        .and_then(|g| *g)
-        .unwrap_or_default()
-}
-
 pub async fn save_relay(on: bool) {
     save_field(|s| s.relay = on).await;
 }

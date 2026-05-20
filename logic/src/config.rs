@@ -1,23 +1,28 @@
-//! Network configuration stored in AT24C02 at offset 16.
+//! Network configuration persisted in the AT24C02 EEPROM at byte offset 16
+//! (runtime output state lives separately at offset 0 — see `persistence`).
 //!
-//! Layout (bytes 16..79):
-//!   [16..19]  magic  0xC0, 0x4F, 0x19, 0x1E
-//!   [20..23]  device_ip
-//!   [24..27]  netmask (stored as prefix_len u8 at [24], others unused)
-//!   [28..31]  gateway
-//!   [32..35]  broker_ip
-//!   [36..37]  broker_port (big-endian u16)
-//!   [38]      dhcp (0/1)
-//!   [39..63]  client_id (null-terminated, max 24 chars)
-//!   [64]      CRC8 of bytes [16..64]
+//! On-EEPROM layout: 49 bytes spanning [16..65), addresses absolute:
+//!   [16..20)  magic 0xC0 0x4F 0x19 0x1E  — rejects blank / foreign EEPROMs
+//!   [20..24)  device IP (4 octets)
+//!   [24]      prefix_len (CIDR bits, e.g. 24);  [25..28) unused
+//!   [28..32)  gateway (4 octets)
+//!   [32..36)  broker IP (4 octets)
+//!   [36..38)  broker port (big-endian u16)
+//!   [38]      reserved (was a DHCP flag; firmware is static-IP only)
+//!   [39..63)  client_id, NUL-terminated, max 24 bytes
+//!   [63..65)  reserved
 //!
-//! Pure structs are no_std + unit-testable natively.
+//! Validation is magic-only: a wrong magic falls back to Default. There is no
+//! CRC — a torn EEPROM write can yield a struct that passes the magic check, so
+//! callers treat a bad-looking config by reverting to defaults, not by trusting it.
+//!
+//! These are plain-data structs with no hardware deps, so (de)serialisation is
+//! unit-tested natively on the host — see tests/config_parser.rs.
 
 pub const DEFAULT_IP: [u8; 4] = [192, 168, 137, 2];
 pub const DEFAULT_GW: [u8; 4] = [192, 168, 137, 1];
 pub const DEFAULT_BROKER: [u8; 4] = [192, 168, 137, 1];
 pub const DEFAULT_PORT: u16 = 1883;
-pub const DEFAULT_DHCP: bool = false;
 pub const DEFAULT_PREFIX: u8 = 24;
 pub const DEFAULT_ID: &str = "stm32-jzf407";
 
@@ -31,7 +36,6 @@ pub struct NetworkConfig {
     pub gateway: [u8; 4],
     pub broker_ip: [u8; 4],
     pub broker_port: u16,
-    pub dhcp: bool,
     pub client_id: heapless::String<24>,
 }
 
@@ -43,14 +47,14 @@ impl Default for NetworkConfig {
             gateway: DEFAULT_GW,
             broker_ip: DEFAULT_BROKER,
             broker_port: DEFAULT_PORT,
-            dhcp: DEFAULT_DHCP,
             client_id: heapless::String::try_from(DEFAULT_ID).unwrap_or_default(),
         }
     }
 }
 
 impl NetworkConfig {
-    /// Serialise to 49-byte buffer (no CRC byte — caller appends separately).
+    /// Serialise into the fixed 49-byte EEPROM image. Offsets here are relative
+    /// to the buffer start (EEPROM byte 16); see the module-level layout doc.
     pub fn to_bytes(&self) -> [u8; LEN] {
         let mut b = [0u8; LEN];
         b[0..4].copy_from_slice(&MAGIC);
@@ -60,7 +64,7 @@ impl NetworkConfig {
         b[16..20].copy_from_slice(&self.broker_ip);
         b[20] = (self.broker_port >> 8) as u8;
         b[21] = self.broker_port as u8;
-        b[22] = self.dhcp as u8;
+        // b[22] is reserved (former DHCP flag) — left zero to keep the layout stable.
         let id = self.client_id.as_bytes();
         let n = id.len().min(24);
         b[23..23 + n].copy_from_slice(&id[..n]);
@@ -86,7 +90,6 @@ impl NetworkConfig {
             gateway: [b[12], b[13], b[14], b[15]],
             broker_ip: [b[16], b[17], b[18], b[19]],
             broker_port: port,
-            dhcp: b[22] != 0,
             client_id: heapless::String::try_from(id).ok()?,
         })
     }

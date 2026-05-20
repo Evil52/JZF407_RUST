@@ -1,6 +1,7 @@
 MEMORY
 {
-    /* STM32F407VETx: 512K Flash, 192K RAM (128K SRAM1 + 64K SRAM2 + 64K CCM) */
+    /* STM32F407VETx: 512K Flash, 192K RAM total = 128K SRAM (112K SRAM1 + 16K SRAM2) + 64K CCM.
+       CCM is core-coupled (CPU-only, no DMA) — we use its top word as a reset-reason marker. */
     FLASH  : ORIGIN = 0x08000000, LENGTH = 512K
     RAM    : ORIGIN = 0x20000000, LENGTH = 128K
     CCMRAM : ORIGIN = 0x10000000, LENGTH = 64K

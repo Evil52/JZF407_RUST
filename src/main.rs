@@ -219,6 +219,6 @@ async fn main(spawner: Spawner) {
     embassy_time::Timer::after(embassy_time::Duration::from_millis(3000)).await;
 
     spawner.spawn(net::net_task(runner).unwrap());
-    spawner.spawn(mqtt::mqtt_task(stack.clone(), net_cfg.clone(), reset_reason).unwrap());
+    spawner.spawn(mqtt::mqtt_task(stack, net_cfg.clone(), reset_reason).unwrap());
     spawner.spawn(web::web_task(stack, net_cfg).unwrap());
 }

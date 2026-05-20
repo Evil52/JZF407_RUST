@@ -1,5 +1,12 @@
-//! Shared output state protected by a Mutex. Active-LOW: High = off, Low = on.
-//! LEDs and relay are shared so both buttons_task and mqtt_task/web_task can drive them.
+//! Shared GPIO outputs (LED1, LED2, relay) behind a single mutex so that
+//! buttons_task, mqtt_task and web_task can all drive them without owning the pins.
+//!
+//! Polarity differs per output and is the #1 source of confusion when debugging:
+//!   - LEDs  are active-LOW  → on = set_low(),  off = set_high()
+//!   - Relay is active-HIGH → on = set_high(), off = set_low()
+//!
+//! All accessors use `try_lock()` (never block): a momentarily-contended output
+//! is simply skipped rather than stalling an async task in a critical section.
 
 use embassy_stm32::gpio::Output;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
@@ -14,6 +21,12 @@ pub struct OutputPins {
 
 pub struct SharedOutputs {
     inner: Mutex<CriticalSectionRawMutex, Option<OutputPins>>,
+}
+
+impl Default for SharedOutputs {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SharedOutputs {

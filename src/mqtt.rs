@@ -19,7 +19,10 @@ use rust_mqtt::{
     Bytes,
 };
 
-/// Signal from buttons_task → mqtt_task: relay state changed.
+/// Relay-changed notification from buttons_task / web_task → mqtt_task, so the
+/// new state gets published to `stm32/relay`. Deliberately NOT signalled from
+/// the MQTT receive path (handle_event): the broker echoes our own publish back
+/// (we subscribe to that topic), which would loop forever. See handle_event.
 pub static RELAY_CHANGE: Signal<CriticalSectionRawMutex, bool> = Signal::new();
 
 const MQTT_TOPIC_LED1: &str = "stm32/led/1";

@@ -88,11 +88,7 @@ async fn send_page(socket: &mut TcpSocket<'_>, cfg: &NetworkConfig) {
     w(socket, port.as_str()).await;
     w(socket, "'></div></div><label>Client ID</label><input type='text' name='id' value='").await;
     w(socket, cfg.client_id.as_str()).await;
-    w(socket, "'><div class='chk'><input type='checkbox' id='dhcp' name='dhcp' value='1'").await;
-    if cfg.dhcp {
-        w(socket, " checked").await;
-    }
-    w(socket, "><label for='dhcp'>Enable DHCP</label></div><button class='save'>Save Settings</button></form></div><div class='foot'><form method='post' action='/reboot'><button class='reboot'>Reboot Device</button></form></div></div>").await;
+    w(socket, "'><button class='save'>Save Settings</button></form></div><div class='foot'><form method='post' action='/reboot'><button class='reboot'>Reboot Device</button></form></div></div>").await;
 
     w(socket, PAGE_FOOT).await;
     let _ = socket.flush().await;
@@ -257,9 +253,6 @@ fn parse_form(body: &str, current: &NetworkConfig) -> Option<NetworkConfig> {
             }
             "id" => {
                 cfg.client_id = HString::try_from(val.as_str()).ok()?;
-            }
-            "dhcp" => {
-                cfg.dhcp = val == "1";
             }
             _ => {}
         }

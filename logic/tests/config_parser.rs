@@ -36,7 +36,6 @@ fn default_config_round_trip() {
     assert_eq!(restored.gateway,     cfg.gateway);
     assert_eq!(restored.broker_ip,   cfg.broker_ip);
     assert_eq!(restored.broker_port, cfg.broker_port);
-    assert_eq!(restored.dhcp,        cfg.dhcp);
     assert_eq!(restored.client_id,   cfg.client_id);
 }
 
@@ -47,14 +46,12 @@ fn custom_config_round_trip() {
     cfg.gateway     = [10, 0, 0, 1];
     cfg.broker_ip   = [10, 0, 0, 2];
     cfg.broker_port = 8883;
-    cfg.dhcp        = true;
     cfg.client_id   = heapless::String::try_from("factory-ctrl-01").unwrap();
 
     let bytes = cfg.to_bytes();
     let r = NetworkConfig::from_bytes(&bytes).unwrap();
     assert_eq!(r.ip,          [10,0,0,5]);
     assert_eq!(r.broker_port, 8883);
-    assert!(r.dhcp);
     assert_eq!(r.client_id.as_str(), "factory-ctrl-01");
 }
 

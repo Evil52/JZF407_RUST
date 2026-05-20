@@ -7,7 +7,8 @@ const BASE: u8 = 16;
 const LEN: usize = 49;
 
 /// Read NetworkConfig from AT24C02 starting at byte 16.
-/// Returns defaults if magic or CRC is wrong, or on I2C error.
+/// Returns defaults if the magic is wrong or on any I2C error, so a blank or
+/// unreachable EEPROM always boots the device on its built-in defaults.
 pub fn load_config() -> NetworkConfig {
     let mut buf = [0u8; LEN];
     let read_ok = crate::eeprom::EEPROM

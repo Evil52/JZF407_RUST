@@ -6,7 +6,7 @@ resolver = "2"
 name = "jzf407vet6"
 version = "0.1.0"
 edition = "2021"
-authors = ["Evil"]
+authors = ["Evil aka Innovation aka sl7m"]
 
 [dependencies]
 jzf407-logic = { path = "logic" }
@@ -22,15 +22,17 @@ embassy-stm32      = { version = "0.6", features = [
     "exti",
     "memory-x",
 ] }
-embassy-net        = { version = "0.9", features = ["tcp", "udp", "dhcpv4", "medium-ethernet", "proto-ipv4"] }
+# Static IPv4 + TCP only — no DHCP/UDP (the firmware never opens a UDP socket
+# and main.rs always applies a static config). Drop these features to shrink the
+# smoltcp/embassy-net code that gets linked in.
+embassy-net        = { version = "0.9", features = ["tcp", "medium-ethernet", "proto-ipv4"] }
 embassy-time       = { version = "0.5", features = ["tick-hz-1_000_000"] }
 embassy-sync       = { version = "0.8" }
 embassy-futures    = { version = "0.1" }
 
 smoltcp            = { version = "0.11", default-features = false, features = [
-    "socket-tcp", "socket-udp",
+    "socket-tcp",
     "medium-ethernet", "proto-ipv4",
-    "socket-dhcpv4",
 ] }
 
 rust-mqtt          = { version = "0.5", default-features = false, features = ["v5", "bump", "defmt", "log-level-info"] }
