@@ -44,4 +44,11 @@ impl SharedOutputs {
             }
         }
     }
+
+    /// Read actual relay pin state (active-HIGH: High = ON).
+    pub fn get_relay(&self) -> bool {
+        self.inner.try_lock().ok()
+            .and_then(|g| g.as_ref().map(|p| p.relay.is_set_high()))
+            .unwrap_or(false)
+    }
 }

@@ -56,7 +56,7 @@ async fn w(socket: &mut TcpSocket<'_>, s: &str) {
 /// Stream the config + relay-control page directly to the socket. Streaming in
 /// flash-resident chunks avoids building a multi-KB HTML buffer on the stack.
 async fn send_page(socket: &mut TcpSocket<'_>, cfg: &NetworkConfig) {
-    let st = crate::persistence::current_state();
+    let relay_on = crate::OUTPUTS.get_relay();
     let ip = fmt_ipv4(&cfg.ip);
     let gw = fmt_ipv4(&cfg.gateway);
     let bk = fmt_ipv4(&cfg.broker_ip);
@@ -68,7 +68,7 @@ async fn send_page(socket: &mut TcpSocket<'_>, cfg: &NetworkConfig) {
 
     // Header + relay control
     w(socket, "<div class='card'><div class='hd'><h1>JZF407VET6 Controller</h1><p>STM32F407 · Embassy · MQTT</p></div><div class='bd'><div class='relay'><div><div class='lbl'>Relay</div>").await;
-    if st.relay {
+    if relay_on {
         w(socket, "<span class='pill on'><span class='dot'></span>ON</span>").await;
     } else {
         w(socket, "<span class='pill off'><span class='dot'></span>OFF</span>").await;
