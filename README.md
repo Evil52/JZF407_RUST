@@ -1,5 +1,10 @@
 <img width="1280" height="964" alt="5220009269544033595" src="https://github.com/user-attachments/assets/3b42ccd4-64f0-4958-8391-096231b77592" />
 
+<img width="1624" height="951" alt="image" src="https://github.com/user-attachments/assets/c134b543-1c5f-4325-94a0-dcb42f1c8208" />
+
+<img width="1606" height="838" alt="image" src="https://github.com/user-attachments/assets/01725b13-57a9-4a2d-b305-89db30646d54" />
+
+
 Ссылка на схему
 [JZ-F407VET6.pdf](https://github.com/user-attachments/files/28059060/JZ-F407VET6.pdf)
 
