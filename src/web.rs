@@ -1,9 +1,9 @@
-use core::sync::atomic::Ordering;
 use crate::fault_marker::ResetReason;
+use core::sync::atomic::Ordering;
 use defmt::{info, warn};
 use embassy_net::{tcp::TcpSocket, Stack};
-use embedded_io_async::Write;
 use embassy_time::{Duration, Instant, Timer};
+use embedded_io_async::Write;
 use heapless::String as HString;
 use jzf407_logic::config::{parse_ipv4, parse_port, NetworkConfig};
 
@@ -153,8 +153,18 @@ async fn send_page(
     w(socket, "<div class='card'><div class='bd'><div class='sec first'>Status</div><div class='kv'><span class='k'>Link</span>").await;
     pill(socket, "lk", link_up, if link_up { "Up" } else { "Down" }).await;
     w(socket, "</div><div class='kv'><span class='k'>MQTT</span>").await;
-    pill(socket, "mq", mqtt_up, if mqtt_up { "Online" } else { "Offline" }).await;
-    w(socket, "</div><div class='kv'><span class='k'>IP</span><span class='v' id='ip'>").await;
+    pill(
+        socket,
+        "mq",
+        mqtt_up,
+        if mqtt_up { "Online" } else { "Offline" },
+    )
+    .await;
+    w(
+        socket,
+        "</div><div class='kv'><span class='k'>IP</span><span class='v' id='ip'>",
+    )
+    .await;
     w(socket, ip.as_str()).await;
     w(socket, "</span></div><div class='kv'><span class='k'>Uptime</span><span class='v' id='up'>—</span></div><div class='kv'><span class='k'>Last reset</span><span class='v' id='rst'>").await;
     w(socket, reset.as_str()).await;
@@ -163,15 +173,31 @@ async fn send_page(
     // Config form
     w(socket, "<div class='card'><div class='bd'><form method='post' action='/save'><div class='sec first'>Network</div><label>IP address</label><input type='text' name='ip' value='").await;
     w(socket, ip.as_str()).await;
-    w(socket, "'><div class='row'><div><label>Prefix</label><input type='number' name='prefix' value='").await;
+    w(
+        socket,
+        "'><div class='row'><div><label>Prefix</label><input type='number' name='prefix' value='",
+    )
+    .await;
     w(socket, prefix.as_str()).await;
-    w(socket, "'></div><div><label>Gateway</label><input type='text' name='gw' value='").await;
+    w(
+        socket,
+        "'></div><div><label>Gateway</label><input type='text' name='gw' value='",
+    )
+    .await;
     w(socket, gw.as_str()).await;
     w(socket, "'></div></div><div class='sec'>MQTT Broker</div><div class='row'><div><label>Broker IP</label><input type='text' name='broker' value='").await;
     w(socket, bk.as_str()).await;
-    w(socket, "'></div><div><label>Port</label><input type='number' name='port' value='").await;
+    w(
+        socket,
+        "'></div><div><label>Port</label><input type='number' name='port' value='",
+    )
+    .await;
     w(socket, port.as_str()).await;
-    w(socket, "'></div></div><label>Client ID</label><input type='text' name='id' value='").await;
+    w(
+        socket,
+        "'></div></div><label>Client ID</label><input type='text' name='id' value='",
+    )
+    .await;
     w(socket, cfg.client_id.as_str()).await;
     w(socket, "'><button class='save'>Save Settings</button></form></div><div class='foot'><form method='post' action='/reboot'><button class='reboot'>Reboot Device</button></form></div></div>").await;
 
@@ -231,6 +257,10 @@ pub async fn web_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: R
     loop {
         let mut socket = TcpSocket::new(stack, rx_buf, tx_buf);
         socket.set_timeout(Some(Duration::from_secs(10)));
+        // Disable Nagle: with ~30 small write_all() calls per page, Nagle + the
+        // host's delayed-ACK (40–200 ms) would stall each write until the previous
+        // segment is ACKed, making the page take several seconds to load.
+        socket.set_nagle_enabled(false);
 
         if socket.accept(80).await.is_err() {
             Timer::after(Duration::from_millis(100)).await;
@@ -258,9 +288,14 @@ pub async fn web_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: R
         match (method, path) {
             ("GET", "/") => {
                 send_page(&mut socket, &cfg, stack, reset_reason).await;
+                // Graceful FIN so the browser gets a clean EOF, not a RST.
+                // Without this, drop() calls abort() → RST → fetch('/state')
+                // fails with ERR_CONNECTION_RESET and live updates stop working.
+                socket.close();
             }
             ("GET", "/state") => {
                 send_state(&mut socket, &cfg, stack, reset_reason).await;
+                socket.close();
             }
             ("POST", "/relay/on") | ("POST", "/relay/off") => {
                 let on = path.ends_with("on");
@@ -310,6 +345,7 @@ pub async fn web_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: R
             }
             _ => {
                 let _ = socket.write_all(HTTP_404.as_bytes()).await;
+                socket.close();
             }
         }
     }
@@ -328,7 +364,14 @@ fn parse_form(body: &str, current: &NetworkConfig) -> Option<NetworkConfig> {
                 cfg.ip = parse_ipv4(&val)?;
             }
             "prefix" => {
-                cfg.prefix_len = val.parse::<u8>().ok()?;
+                // Reject 0 and >32: smoltcp's Ipv4Cidr::new asserts prefix_len<=32
+                // and would panic at boot, bricking the board into a reset loop
+                // until the EEPROM is wiped. Treat as invalid form (→ 400).
+                let p = val.parse::<u8>().ok()?;
+                if !(1..=32).contains(&p) {
+                    return None;
+                }
+                cfg.prefix_len = p;
             }
             "gw" => {
                 cfg.gateway = parse_ipv4(&val)?;
