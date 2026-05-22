@@ -67,3 +67,60 @@ fn short_buffer_returns_none() {
     let bytes = [0u8; 10];
     assert!(NetworkConfig::from_bytes(&bytes).is_none());
 }
+
+// ---- credentials ----
+
+#[test]
+fn credentials_round_trip() {
+    let mut cfg = NetworkConfig::default();
+    cfg.mqtt_user = heapless::String::try_from("broker-user").unwrap();
+    cfg.mqtt_pass = heapless::String::try_from("s3cr3t-pass").unwrap();
+    cfg.web_user  = heapless::String::try_from("admin").unwrap();
+    cfg.web_pass  = heapless::String::try_from("hunter2").unwrap();
+
+    let r = NetworkConfig::from_bytes(&cfg.to_bytes()).unwrap();
+    assert_eq!(r.mqtt_user.as_str(), "broker-user");
+    assert_eq!(r.mqtt_pass.as_str(), "s3cr3t-pass");
+    assert_eq!(r.web_user.as_str(),  "admin");
+    assert_eq!(r.web_pass.as_str(),  "hunter2");
+    // Original network fields survive alongside the new ones.
+    assert_eq!(r.ip, cfg.ip);
+    assert_eq!(r.client_id, cfg.client_id);
+}
+
+#[test]
+fn max_length_credentials_round_trip() {
+    let full = "A".repeat(jzf407_logic::config::CRED_MAX); // exactly 32 bytes, no NUL terminator
+    let mut cfg = NetworkConfig::default();
+    cfg.mqtt_pass = heapless::String::try_from(full.as_str()).unwrap();
+
+    let r = NetworkConfig::from_bytes(&cfg.to_bytes()).unwrap();
+    assert_eq!(r.mqtt_pass.as_str(), full.as_str());
+}
+
+#[test]
+fn default_has_empty_credentials() {
+    let cfg = NetworkConfig::default();
+    assert!(cfg.mqtt_user.is_empty());
+    assert!(cfg.web_pass.is_empty());
+}
+
+#[test]
+fn legacy_image_upgrades_to_empty_credentials() {
+    // Simulate a device flashed before credentials existed: the 49-byte legacy
+    // image, padded out to the new length with 0xFF (a blank AT24C02). The new
+    // parser must keep the network config and yield empty credentials, not bail.
+    let cfg = NetworkConfig::default();
+    let full = cfg.to_bytes(); // 175 bytes
+    let mut legacy = full;
+    for b in legacy.iter_mut().skip(49) {
+        *b = 0xFF; // everything past the old layout is unwritten flash
+    }
+    let r = NetworkConfig::from_bytes(&legacy).expect("legacy image must still parse");
+    assert_eq!(r.ip, cfg.ip);
+    assert_eq!(r.client_id, cfg.client_id);
+    assert!(r.mqtt_user.is_empty());
+    assert!(r.mqtt_pass.is_empty());
+    assert!(r.web_user.is_empty());
+    assert!(r.web_pass.is_empty());
+}

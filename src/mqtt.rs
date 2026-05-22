@@ -110,10 +110,28 @@ pub async fn mqtt_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: 
         let will_opts = WillOptions::new(will_topic, will_msg).retain();
 
         // keep_alive = 120 s (broker timeout); heartbeat publish every 10 s covers unreliable networks
-        let connect_opts = ConnectOptions::new()
+        let mut connect_opts = ConnectOptions::new()
             .clean_start()
             .keep_alive(KeepAlive::Seconds(core::num::NonZero::new(120).unwrap()))
             .will(will_opts);
+
+        // Authenticate with the broker if credentials are configured. Empty
+        // username/password => connect anonymously (pre-auth behaviour). The
+        // borrowed cfg.* strings outlive connect_opts (cfg lives for the whole
+        // task), so this is fine across the reconnect loop.
+        //
+        // NOTE: MQTT v3.1.1/v5 send these in the CLEAR. Over the public internet
+        // on port 1883 anyone sniffing the path can read them — see README.
+        if !cfg.mqtt_user.is_empty() {
+            if let Ok(u) = MqttString::from_str(cfg.mqtt_user.as_str()) {
+                connect_opts = connect_opts.user_name(u);
+            }
+        }
+        if !cfg.mqtt_pass.is_empty() {
+            if let Ok(p) = MqttBinary::try_from(cfg.mqtt_pass.as_bytes()) {
+                connect_opts = connect_opts.password(p);
+            }
+        }
 
         match client.connect(socket, &connect_opts, client_id).await {
             Ok(_) => {

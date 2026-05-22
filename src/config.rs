@@ -2,9 +2,11 @@
 
 use crate::eeprom;
 pub use jzf407_logic::config::NetworkConfig;
+// Single source of truth for the serialised image size (now 175 B with the
+// MQTT + web credential fields appended) — see logic::config layout doc.
+use jzf407_logic::config::LEN;
 
 const BASE: u8 = 16;
-const LEN: usize = 49;
 
 /// Read NetworkConfig from AT24C02 starting at byte 16.
 /// Returns defaults if the magic is wrong or on any I2C error, so a blank or

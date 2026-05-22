@@ -16,6 +16,9 @@ const HTTP_OK_JSON: &str =
 const HTTP_303: &str = "HTTP/1.1 303 See Other\r\nLocation: /\r\nConnection: close\r\n\r\n";
 const HTTP_400: &str = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nBad Request";
 const HTTP_404: &str = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\nNot Found";
+// 401 carries WWW-Authenticate so the browser pops its native login dialog and
+// then resends the request with an Authorization: Basic header.
+const HTTP_401: &str = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"JZF407\"\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n<h1>401 Unauthorized</h1>";
 
 const PAGE_HEAD: &str = "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>\
 <meta name='viewport' content='width=device-width,initial-scale=1'><title>JZF407VET6</title>\
@@ -199,7 +202,20 @@ async fn send_page(
     )
     .await;
     w(socket, cfg.client_id.as_str()).await;
-    w(socket, "'><button class='save'>Save Settings</button></form></div><div class='foot'><form method='post' action='/reboot'><button class='reboot'>Reboot Device</button></form></div></div>").await;
+
+    // MQTT broker credentials (sent in the CONNECT packet). Empty = anonymous.
+    w(socket, "'><div class='sec'>MQTT Auth</div><div class='row'><div><label>Username</label><input type='text' name='muser' value='").await;
+    w(socket, cfg.mqtt_user.as_str()).await;
+    w(socket, "'></div><div><label>Password</label><input type='password' name='mpass' value='").await;
+    w(socket, cfg.mqtt_pass.as_str()).await;
+
+    // Web login (HTTP Basic Auth). Leaving BOTH blank disables the login prompt.
+    w(socket, "'></div></div><div class='sec'>Web Login</div><div class='row'><div><label>Username</label><input type='text' name='wuser' value='").await;
+    w(socket, cfg.web_user.as_str()).await;
+    w(socket, "'></div><div><label>Password</label><input type='password' name='wpass' value='").await;
+    w(socket, cfg.web_pass.as_str()).await;
+
+    w(socket, "'></div></div><button class='save'>Save Settings</button></form></div><div class='foot'><form method='post' action='/reboot'><button class='reboot'>Reboot Device</button></form></div></div>").await;
 
     w(socket, PAGE_FOOT).await;
     let _ = socket.flush().await;
@@ -254,6 +270,18 @@ pub async fn web_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: R
     let tx_buf = TX_BUF.init([0u8; 4096]);
     let req_buf = REQ_BUF.init([0u8; 1536]);
 
+    // HTTP Basic Auth. Enabled only when a web username or password is set; an
+    // all-empty pair leaves the page open (matches a fresh/upgraded device on a
+    // trusted LAN). The expected base64(user:pass) token is built once here and
+    // compared against the Authorization header on every request.
+    let auth_required = !cfg.web_user.is_empty() || !cfg.web_pass.is_empty();
+    let expected_token = jzf407_logic::auth::basic_token(cfg.web_user.as_str(), cfg.web_pass.as_str());
+    if auth_required {
+        info!("WEB: HTTP Basic Auth enabled");
+    } else {
+        warn!("WEB: no web password set — page is open to anyone who can reach it");
+    }
+
     loop {
         let mut socket = TcpSocket::new(stack, rx_buf, tx_buf);
         socket.set_timeout(Some(Duration::from_secs(10)));
@@ -279,6 +307,15 @@ pub async fn web_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: R
                 continue;
             }
         };
+
+        // Gate every request behind Basic Auth (incl. /state, which the browser
+        // re-sends credentials for automatically once it has them).
+        if auth_required && !request_authorized(req, expected_token.as_str()) {
+            let _ = socket.write_all(HTTP_401.as_bytes()).await;
+            let _ = socket.flush().await;
+            socket.close();
+            continue;
+        }
 
         let first_line = req.lines().next().unwrap_or("");
         let mut parts = first_line.split_whitespace();
@@ -351,6 +388,23 @@ pub async fn web_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: R
     }
 }
 
+/// True if the request carries an `Authorization: Basic <token>` header whose
+/// token equals `expected`. Header name is matched case-insensitively (per RFC);
+/// the token is compared verbatim against the precomputed base64(user:pass).
+fn request_authorized(req: &str, expected: &str) -> bool {
+    const PREFIX: &str = "authorization:";
+    for line in req.lines() {
+        if line.len() < PREFIX.len() || !line[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+            continue;
+        }
+        let val = line[PREFIX.len()..].trim();
+        if let Some(token) = val.strip_prefix("Basic ") {
+            return token.trim() == expected;
+        }
+    }
+    false
+}
+
 fn parse_form(body: &str, current: &NetworkConfig) -> Option<NetworkConfig> {
     let mut cfg = current.clone();
     for pair in body.split('&') {
@@ -384,6 +438,19 @@ fn parse_form(body: &str, current: &NetworkConfig) -> Option<NetworkConfig> {
             }
             "id" => {
                 cfg.client_id = HString::try_from(val.as_str()).ok()?;
+            }
+            // Credentials: a value longer than the 32-byte field is rejected (→ 400).
+            "muser" => {
+                cfg.mqtt_user = HString::try_from(val.as_str()).ok()?;
+            }
+            "mpass" => {
+                cfg.mqtt_pass = HString::try_from(val.as_str()).ok()?;
+            }
+            "wuser" => {
+                cfg.web_user = HString::try_from(val.as_str()).ok()?;
+            }
+            "wpass" => {
+                cfg.web_pass = HString::try_from(val.as_str()).ok()?;
             }
             _ => {}
         }

@@ -261,10 +261,10 @@ override it (e.g. `DEFMT_LOG=info`) to reduce log volume.
 cargo test -p jzf407-logic --target aarch64-apple-darwin
 ```
 
-50 tests: `debouncer` (11), `led_dispatch` (20), `config_parser` (19). The
-`logic` crate has its own [`logic/.cargo/config.toml`](logic/.cargo/config.toml)
-so `cargo test` inside that directory also runs natively without the explicit
-`--target`.
+59 tests: `debouncer` (11), `led_dispatch` (20), `config_parser` (23), `auth`
+(5). The `logic` crate has its own
+[`logic/.cargo/config.toml`](logic/.cargo/config.toml) so `cargo test` inside
+that directory also runs natively without the explicit `--target`.
 
 ---
 
@@ -294,7 +294,21 @@ defaults above, so you can never permanently lock yourself out via config.
 
 Open `http://<device-ip>/` (default `http://192.168.137.2/`). The page streams
 directly from flash-resident chunks (no large HTML buffer on the stack) and
-offers live relay control plus the full network/MQTT config form.
+offers live relay control plus the full network/MQTT config form (including the
+MQTT and web-login credentials).
+
+**HTTP Basic Auth.** Set a *Web Login* username/password on the page and every
+request — page, `/state` poll, and all POST actions — then requires an
+`Authorization: Basic` header; the browser prompts once and remembers it.
+Leaving **both** web fields blank disables the prompt (open page — the default,
+and how a device flashed before this feature behaves). The firmware never
+decodes the header: it builds the expected `base64(user:pass)` once at boot and
+compares (see [`logic/src/auth.rs`](logic/src/auth.rs), unit-tested on the host).
+
+> ⚠️ Basic Auth over plain `http://` sends the credentials base64-encoded, **not
+> encrypted** — same caveat as MQTT above. It stops casual access from the open
+> internet but is not a substitute for TLS. Use a strong password and, if
+> possible, restrict the forwarded port by source IP.
 
 | Method | Path | Action |
 |--------|------|--------|
@@ -314,6 +328,19 @@ returns `400` and does **not** write or reboot.
 The client connects to the configured broker, sets an LWT, then subscribes to
 the control topics. A 3 s grace period after connect drops retained messages so
 a stale retained command can't fire on every reconnect.
+
+**Authentication.** If an MQTT username is configured (web page → *MQTT Auth*,
+persisted in EEPROM), it is sent in the CONNECT packet along with the password;
+leave both blank to connect anonymously. Configure your broker to require these
+credentials — e.g. mosquitto `password_file` + `allow_anonymous false` — so an
+unauthenticated client cannot publish to `stm32/#`.
+
+> ⚠️ **Plaintext over the wire.** MQTT on port 1883 sends the username and
+> password unencrypted. On a trusted LAN that is fine; **exposed to the public
+> internet (e.g. via port-forwarding) anyone on the path can read them.** This
+> firmware does not implement MQTT-over-TLS (see audit §3.1.5) — for an
+> internet-facing deployment, terminate TLS at the broker and tunnel the device
+> link, or restrict the forwarded port by source IP.
 
 | Topic | Payload | Dir | Description |
 |-------|---------|-----|-------------|
@@ -361,20 +388,29 @@ EEPROM is only written when a value actually changes (saves write cycles).
 **Network config — offset 16** (`logic/src/config.rs`, magic `C0 4F 19 1E`)
 
 ```
-[16..20)  magic
-[20..24)  device IP
-[24]      prefix_len (CIDR);  [25..28) unused
-[28..32)  gateway
-[32..36)  broker IP
-[36..38)  broker port (big-endian u16)
-[38]      reserved (former DHCP flag)
-[39..63)  client_id (NUL-terminated, ≤24 bytes)
-[63..65)  reserved
+[16..20)    magic
+[20..24)    device IP
+[24]        prefix_len (CIDR);  [25..28) unused
+[28..32)    gateway
+[32..36)    broker IP
+[36..38)    broker port (big-endian u16)
+[38]        reserved (former DHCP flag)
+[39..63)    client_id    (NUL-terminated, ≤24 bytes)
+[63..95)    MQTT username (NUL-terminated, ≤32 bytes)
+[95..127)   MQTT password (NUL-terminated, ≤32 bytes)
+[127..159)  web username  (NUL-terminated, ≤32 bytes)
+[159..191)  web password  (NUL-terminated, ≤32 bytes)
 ```
 
 Validation is **magic-only** (no CRC). A wrong magic → defaults. A torn write
 could in theory pass the magic check, so config is treated as advisory: anything
 that fails to parse reverts to defaults rather than being trusted.
+
+The four credential fields were appended after the original 49-byte layout. A
+device flashed before this change has blank (`0xFF`) bytes in `[63..191)`; those
+parse leniently to **empty** strings, so an upgrade preserves the existing
+network config and boots with no credentials (anonymous MQTT + open web page) —
+exactly the pre-auth behaviour.
 
 ---
 
@@ -502,8 +538,9 @@ JZF407VET6/
     ├── src/
     │   ├── debouncer.rs    sample-history debounce state machine
     │   ├── led_dispatch.rs MQTT topic+payload → OutputCmd
+    │   ├── auth.rs         HTTP Basic Auth token builder (base64 of user:pass)
     │   └── config.rs       NetworkConfig (de)serialization + parse_ipv4/parse_port
-    └── tests/              50 native unit tests
+    └── tests/              59 native unit tests
 ```
 
 The `logic` crate deliberately has **no Embassy or hardware dependencies** so
