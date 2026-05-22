@@ -38,7 +38,10 @@
       "PowerShell(Get-Process chrome -ErrorAction SilentlyContinue)",
       "PowerShell(Stop-Process -Force)",
       "PowerShell(ping -n 3 192.168.137.177 2>&1)",
-      "PowerShell(findstr /i \"vmware\\\\|vmnet\\\\|192.168.137\")"
+      "PowerShell(findstr /i \"vmware\\\\|vmnet\\\\|192.168.137\")",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git config *)"
     ]
   }
 }

@@ -14,6 +14,6 @@ pub async fn heartbeat_led_task(mut led3: Output<'static>) {
         led3.set_low(); // active-LOW: drive low = LED on
         Timer::after(Duration::from_millis(100)).await;
         led3.set_high(); // LED off
-        Timer::after(Duration::from_millis(100)).await;
+        Timer::after(Duration::from_millis(5000)).await;
     }
 }
