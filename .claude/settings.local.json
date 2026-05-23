@@ -41,7 +41,10 @@
       "PowerShell(findstr /i \"vmware\\\\|vmnet\\\\|192.168.137\")",
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
-      "Bash(git config *)"
+      "Bash(git config *)",
+      "Bash(cargo check *)",
+      "Bash(timeout 180 bash -c 'while pgrep -f \"rustup.*thumbv7em\" >/dev/null; do sleep 1; done; echo \"Done\"')",
+      "Bash(cargo install *)"
     ]
   }
 }
