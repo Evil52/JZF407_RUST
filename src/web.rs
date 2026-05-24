@@ -70,6 +70,8 @@ button::after{bottom:-1px;right:-1px;border-left:none;border-top:none}\
 
 /// Error message shown inside the login form on a failed login attempt.
 const LOGIN_ERROR: &str = "<div class='err'>\u{2715} Invalid username or password</div>";
+/// Lockout message shown when too many failed attempts have been made.
+const LOGIN_LOCKED: &str = "<div class='err'>\u{26a0} Too many failed attempts \u{2014} locked for 60s</div>";
 
 /// Login form (after the optional error message).
 const LOGIN_TAIL: &str = "<form method='post' action='/login'>\
@@ -447,6 +449,18 @@ static SESSION_TOKEN_HI: AtomicU32 = AtomicU32::new(0);
 static SESSION_TOKEN_LO: AtomicU32 = AtomicU32::new(0);
 static SESSION_CREATED: AtomicU32 = AtomicU32::new(0);
 
+/// Brute-force protection: count of consecutive failed login attempts and the
+/// uptime-second of the last failure. After LOGIN_MAX_FAILS consecutive failures
+/// the login form returns 429 and shows a lockout message for LOGIN_LOCKOUT_SECS.
+/// A successful login resets the counter.
+static LOGIN_FAIL_COUNT: AtomicU32 = AtomicU32::new(0);
+static LOGIN_FAIL_LAST: AtomicU32 = AtomicU32::new(0);
+
+const LOGIN_MAX_FAILS: u32 = 5;
+const LOGIN_LOCKOUT_SECS: u64 = 60;
+/// Per-attempt delay on a wrong password — slows down manual and scripted attacks.
+const LOGIN_FAIL_DELAY_MS: u64 = 2000;
+
 const SESSION_TTL_SECS: u32 = 900; // 15 minutes idle timeout
 
 /// Mint a new session token (simple LCG-based pseudo-random, sufficient here).
@@ -680,6 +694,29 @@ async fn serve_connection(
         if !authenticated {
             // POST /login — validate form-submitted credentials (user & pass).
             if method == "POST" && path == "/login" {
+                let now = Instant::now().as_secs();
+                let fails = LOGIN_FAIL_COUNT.load(Ordering::Relaxed);
+                let last_fail = LOGIN_FAIL_LAST.load(Ordering::Relaxed) as u64;
+
+                // Lockout: too many consecutive failures and the window hasn't expired.
+                if fails >= LOGIN_MAX_FAILS
+                    && now.saturating_sub(last_fail) < LOGIN_LOCKOUT_SECS
+                {
+                    warn!("WEB: login locked out ({} fails)", fails);
+                    w(socket, HTTP_401_LOGIN).await;
+                    w(socket, LOGIN_HEAD).await;
+                    w(socket, LOGIN_LOCKED).await;
+                    w(socket, LOGIN_TAIL).await;
+                    let _ = socket.flush().await;
+                    socket.close();
+                    return;
+                }
+
+                // If lockout window expired, reset the counter.
+                if fails >= LOGIN_MAX_FAILS {
+                    LOGIN_FAIL_COUNT.store(0, Ordering::Relaxed);
+                }
+
                 let login_ok = if let Some(body_start) = req.find("\r\n\r\n") {
                     let body = &req[body_start + 4..];
                     let (user_opt, pass_opt) = parse_login_form(body);
@@ -694,7 +731,8 @@ async fn serve_connection(
                 };
 
                 if login_ok {
-                    // Credentials correct — mint session and redirect home.
+                    // Credentials correct — reset fail counter, mint session, redirect.
+                    LOGIN_FAIL_COUNT.store(0, Ordering::Relaxed);
                     let new_token =
                         mint_session_token(token_seed.wrapping_add(Instant::now().as_secs()));
                     SESSION_TOKEN_HI.store((new_token >> 32) as u32, Ordering::Relaxed);
@@ -713,10 +751,24 @@ async fn serve_connection(
                     socket.close();
                     return;
                 }
-                // Credentials wrong — re-show the login form with an error.
+
+                // Credentials wrong — increment fail counter, apply delay, show error.
+                let new_fails = LOGIN_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                LOGIN_FAIL_LAST.store(Instant::now().as_secs() as u32, Ordering::Relaxed);
+                warn!("WEB: failed login attempt #{}", new_fails);
+
+                // Delay before responding — slows brute-force and signals to the user
+                // that the credentials were actually checked (not an instant redirect).
+                Timer::after(Duration::from_millis(LOGIN_FAIL_DELAY_MS)).await;
+
+                let msg = if new_fails >= LOGIN_MAX_FAILS {
+                    LOGIN_LOCKED
+                } else {
+                    LOGIN_ERROR
+                };
                 w(socket, HTTP_401_LOGIN).await;
                 w(socket, LOGIN_HEAD).await;
-                w(socket, LOGIN_ERROR).await;
+                w(socket, msg).await;
                 w(socket, LOGIN_TAIL).await;
                 let _ = socket.flush().await;
                 socket.close();
