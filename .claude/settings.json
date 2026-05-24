@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo expand *)",
+      "Bash(cargo test-host *)",
+      "Bash(echo \"--- exit: $? ---\")"
+    ]
+  }
+}

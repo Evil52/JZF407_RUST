@@ -268,11 +268,12 @@ where
                 crate::persistence::save_leds(on, on).await;
             }
             OutputCmd::Relay(on) => {
-                // Drive the shared relay directly. Do NOT signal RELAY_CHANGE here:
-                // that signal triggers a publish to stm32/relay, which the broker
-                // would echo back to us (we subscribe to it) and loop forever.
-                crate::OUTPUTS.set_relay(on);
-                crate::persistence::save_relay(on).await;
+                // Relay is a momentary pulse: any truthy command fires a 2 s
+                // pulse, falsy cancels it. Timing is owned by relay_task. Do NOT
+                // signal RELAY_CHANGE here: that triggers a publish to
+                // stm32/relay, which the broker would echo back (we subscribe to
+                // it) and loop forever.
+                if on { crate::outputs::pulse_relay() } else { crate::outputs::relay_off() }
             }
             OutputCmd::Ping => {
                 // Reply with pong for RTT measurement

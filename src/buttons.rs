@@ -1,5 +1,6 @@
 //! S1 (PE10) / S2 (PE11) button polling with async debounce.
-//! S1 → relay ON, S2 → relay OFF. Relay PD4, active-HIGH (see OUTPUTS.set_relay).
+//! S1 → fire a 2 s relay pulse, S2 → cancel/force relay OFF. Relay PD4,
+//! active-HIGH; timing is owned by `outputs::relay_task`.
 //! Buttons have hardware pull-ups (R17/R18): idle = High, pressed = Low.
 
 use embassy_stm32::{
@@ -27,16 +28,14 @@ pub async fn buttons_task(
         Timer::after(Duration::from_millis(SAMPLE_PERIOD_MS)).await;
 
         if let Some(Edge::Rising) = deb_s1.update(s1.is_low()) {
-            crate::OUTPUTS.set_relay(true);
-            defmt::info!("S1: relay ON");
+            crate::outputs::pulse_relay();
+            defmt::info!("S1: relay pulse");
             crate::mqtt::RELAY_CHANGE.signal(true);
-            crate::persistence::save_relay(true).await;
         }
         if let Some(Edge::Rising) = deb_s2.update(s2.is_low()) {
-            crate::OUTPUTS.set_relay(false);
-            defmt::info!("S2: relay OFF");
+            crate::outputs::relay_off();
+            defmt::info!("S2: relay off");
             crate::mqtt::RELAY_CHANGE.signal(false);
-            crate::persistence::save_relay(false).await;
         }
     }
 }

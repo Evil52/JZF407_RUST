@@ -163,12 +163,15 @@ async fn main(spawner: Spawner) {
         relay: Output::new(p.PD4, Level::Low, Speed::Low), // active-HIGH: Low = off at boot
     });
 
-    // Apply persisted state to outputs
+    // Apply persisted LED state to outputs. The relay is a momentary pulse
+    // output (relay_task), so it always idles OFF at boot — nothing to restore.
     OUTPUTS.set(LedId::Led1, saved_state.led1);
     OUTPUTS.set(LedId::Led2, saved_state.led2);
-    OUTPUTS.set_relay(saved_state.relay);
 
-    // ---- Buttons (drive the shared relay) ----
+    // ---- Relay pulse driver (owns the 2 s monostable timing) ----
+    spawner.spawn(outputs::relay_task(&OUTPUTS).unwrap());
+
+    // ---- Buttons (trigger relay pulses) ----
     spawner.spawn(buttons::buttons_task(p.PE10, p.PE11).unwrap());
 
     // ---- Ethernet RMII + DP83848 ----

@@ -9,10 +9,67 @@
 //! is simply skipped rather than stalling an async task in a critical section.
 
 use embassy_stm32::gpio::Output;
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex, signal::Signal};
+use embassy_time::{Duration, Timer};
 
 #[derive(Clone, Copy)]
 pub enum LedId { Led1, Led2 }
+
+/// How long the relay stays energised after a trigger before dropping back to OFF.
+pub const RELAY_PULSE: Duration = Duration::from_secs(2);
+
+/// Command sent to `relay_task`. The relay is a monostable pulse output: a
+/// `Pulse` drives it HIGH for `RELAY_PULSE`, then it returns to OFF on its own.
+/// An explicit `Off` cancels an in-flight pulse immediately.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RelayCmd { Pulse, Off }
+
+/// Trigger channel into `relay_task`. Callers (buttons / mqtt / web) never touch
+/// the relay pin directly — they signal a command and `relay_task` owns the
+/// timing. `Signal` keeps only the latest command, which is exactly the
+/// retrigger-restarts-the-timer semantics we want.
+static RELAY_TRIGGER: Signal<CriticalSectionRawMutex, RelayCmd> = Signal::new();
+
+/// Fire a 2 s relay pulse. Returns immediately; the pin is driven by `relay_task`.
+/// Re-triggering while a pulse is active restarts the 2 s window.
+pub fn pulse_relay() {
+    RELAY_TRIGGER.signal(RelayCmd::Pulse);
+}
+
+/// Cancel any in-flight pulse and force the relay OFF now.
+pub fn relay_off() {
+    RELAY_TRIGGER.signal(RelayCmd::Off);
+}
+
+/// Owns relay pulse timing. Idle until a `Pulse` arrives, then holds the relay
+/// HIGH for `RELAY_PULSE`. A new command (`Pulse` retriggers, `Off` cancels)
+/// arriving during the hold preempts the timer via `select`.
+#[embassy_executor::task]
+pub async fn relay_task(outputs: &'static SharedOutputs) {
+    use embassy_futures::select::{select, Either};
+
+    loop {
+        // Idle: relay OFF, wait for the first trigger.
+        match RELAY_TRIGGER.wait().await {
+            RelayCmd::Off => continue, // already off
+            RelayCmd::Pulse => {}
+        }
+
+        // Energise and hold for the pulse window, restarting on each retrigger.
+        loop {
+            outputs.set_relay(true);
+            match select(Timer::after(RELAY_PULSE), RELAY_TRIGGER.wait()).await {
+                // Pulse elapsed with no new trigger → drop and go idle.
+                Either::First(()) => break,
+                // Retriggered → restart the window.
+                Either::Second(RelayCmd::Pulse) => continue,
+                // Explicit off mid-pulse → drop immediately.
+                Either::Second(RelayCmd::Off) => break,
+            }
+        }
+        outputs.set_relay(false);
+    }
+}
 
 pub struct OutputPins {
     pub led1: Output<'static>,
@@ -50,7 +107,10 @@ impl SharedOutputs {
         }
     }
 
-    /// Relay is active-HIGH: on = drive High, off = drive Low (inverted vs. LEDs).
+    /// Drive the relay pin (active-HIGH: on = High, off = Low). Internal to the
+    /// pulse state machine — callers should use [`pulse_relay`] / [`relay_off`]
+    /// rather than touching the pin directly, so timing stays owned by
+    /// [`relay_task`].
     pub fn set_relay(&self, on: bool) {
         if let Ok(mut g) = self.inner.try_lock() {
             if let Some(ref mut p) = *g {

@@ -1,8 +1,12 @@
-//! Persist relay+LED state to AT24C02.
+//! Persist LED state to AT24C02.
+//!
+//! The relay is deliberately NOT persisted: it is a momentary 2 s pulse output
+//! (see `outputs::relay_task`), so it always idles OFF — there is no steady
+//! state to restore. Byte [4] is kept reserved so the layout stays stable.
 //!
 //! Layout (bytes 0..7):
 //!   [0..3]  magic 0xCA, 0xFE, 0xF0, 0x0D
-//!   [4]     relay:  bit0
+//!   [4]     (reserved, was relay)
 //!   [5]     led1:   bit0
 //!   [6]     led2:   bit0
 //!   [7]     (reserved)
@@ -19,7 +23,6 @@ const BASE: u8 = 0;
 
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct OutputState {
-    pub relay: bool,
     pub led1: bool,
     pub led2: bool,
 }
@@ -38,7 +41,6 @@ pub fn load_state() -> OutputState {
         .is_some();
     let state = if read_ok && buf[0..4] == MAGIC {
         OutputState {
-            relay: buf[4] & 1 != 0,
             led1: buf[5] & 1 != 0,
             led2: buf[6] & 1 != 0,
         }
@@ -52,10 +54,6 @@ pub fn load_state() -> OutputState {
     });
 
     state
-}
-
-pub async fn save_relay(on: bool) {
-    save_field(|s| s.relay = on).await;
 }
 
 pub async fn save_led1(on: bool) {
@@ -75,8 +73,8 @@ pub async fn save_leds(led1: bool, led2: bool) {
 }
 
 /// Apply a field update to the cached state and flush to EEPROM only if it
-/// actually changed. Each caller knows just its own output (relay or LEDs);
-/// the cache holds the full state so a partial update never clobbers siblings.
+/// actually changed. Each caller knows just its own LED; the cache holds the
+/// full state so a partial update never clobbers siblings.
 async fn save_field(update: impl FnOnce(&mut OutputState)) {
     let mut cache = STATE_CACHE.lock().await;
     let mut state = (*cache).unwrap_or_default();
@@ -92,7 +90,7 @@ async fn save_field(update: impl FnOnce(&mut OutputState)) {
         MAGIC[1],
         MAGIC[2],
         MAGIC[3],
-        state.relay as u8,
+        0, // [4] reserved (was relay)
         state.led1 as u8,
         state.led2 as u8,
         0,

@@ -333,12 +333,12 @@ fn push_u16_dec<const N: usize>(buf: &mut HString<N>, v: u16) {
     let _ = write!(buf, "{}", v);
 }
 
-/// Global session state: a 64-bit token stored as two 32-bit atomics (top/bottom)
-/// + the Instant it was issued. When a user authenticates via Basic Auth, we mint
-/// a random token, set it as a cookie, and store it here. On subsequent requests
-/// the cookie is checked first — if valid (matches + not expired), Basic Auth is
-/// skipped entirely. Inactivity timeout: the session is refreshed on every
-/// authenticated request.
+/// Global session state: a 64-bit token stored as two 32-bit atomics (top and
+/// bottom halves) plus the Instant it was issued. When a user authenticates via
+/// Basic Auth, we mint a random token, set it as a cookie, and store it here. On
+/// subsequent requests the cookie is checked first — if valid (matching and not
+/// expired), Basic Auth is skipped entirely. Inactivity timeout: the session is
+/// refreshed on every authenticated request.
 static SESSION_TOKEN_HI: AtomicU32 = AtomicU32::new(0);
 static SESSION_TOKEN_LO: AtomicU32 = AtomicU32::new(0);
 static SESSION_CREATED: AtomicU32 = AtomicU32::new(0);
@@ -407,9 +407,8 @@ fn extract_cookie<'a>(req: &'a str, name: &str) -> Option<&'a [u8]> {
         for cookie in val.split(';') {
             let cookie = cookie.trim();
             if let Some(rest) = cookie.strip_prefix(name) {
-                let rest = rest.trim_start();
-                if rest.starts_with('=') {
-                    return Some(rest[1..].trim().as_bytes());
+                if let Some(value) = rest.trim_start().strip_prefix('=') {
+                    return Some(value.trim().as_bytes());
                 }
             }
         }
@@ -482,10 +481,9 @@ pub async fn web_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: R
         let path = parts.next().unwrap_or("/");
 
         // --- Auth gate ---
-        // Priority: 1) valid session cookie  2) Basic Auth  3) login form  4) deny
-        let authenticated = if !auth_required {
-            true
-        } else if validate_session(req) {
+        // Priority: 1) auth disabled or valid session cookie  2) Basic Auth
+        //           3) login form  4) deny
+        let authenticated = if !auth_required || validate_session(req) {
             true
         } else if request_authorized(req, expected_token.as_str()) {
             // Mint a fresh session token on successful Basic Auth, so the browser
@@ -607,11 +605,12 @@ pub async fn web_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: R
             }
             ("POST", "/relay/on") | ("POST", "/relay/off") => {
                 let on = path.ends_with("on");
-                crate::OUTPUTS.set_relay(on);
-                crate::persistence::save_relay(on).await;
+                // Relay is a momentary pulse: /relay/on fires a 2 s pulse,
+                // /relay/off cancels it. Timing is owned by relay_task.
+                if on { crate::outputs::pulse_relay() } else { crate::outputs::relay_off() }
                 // Tell mqtt_task to publish the new state to the broker.
                 crate::mqtt::RELAY_CHANGE.signal(on);
-                info!("WEB: relay {}", if on { "ON" } else { "OFF" });
+                info!("WEB: relay {}", if on { "pulse" } else { "off" });
                 let _ = socket.write_all(HTTP_303.as_bytes()).await;
                 let _ = socket.flush().await;
             }
