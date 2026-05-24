@@ -28,6 +28,7 @@ mod mqtt;
 mod net;
 mod outputs;
 mod persistence;
+mod sse;
 mod watchdog;
 mod web;
 
@@ -223,5 +224,9 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(net::net_task(runner).unwrap());
     spawner.spawn(mqtt::mqtt_task(stack, net_cfg.clone(), reset_reason).unwrap());
-    spawner.spawn(web::web_task(stack, net_cfg, reset_reason).unwrap());
+    // Two-socket web pool: both instances run the same router, so either can
+    // serve a normal request or hold the long-lived GET /events SSE stream while
+    // the other keeps the page responsive. Sockets come from StackResources<8>.
+    spawner.spawn(web::web_task(stack, net_cfg.clone(), reset_reason).unwrap());
+    spawner.spawn(web::web_task_b(stack, net_cfg, reset_reason).unwrap());
 }

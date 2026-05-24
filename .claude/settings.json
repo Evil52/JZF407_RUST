@@ -7,7 +7,14 @@
       "Bash(echo \"exit: $?\")",
       "Bash(python3 -)",
       "Bash(cargo size *)",
-      "Bash(python3 -c ' *)"
+      "Bash(python3 -c ' *)",
+      "Bash(arm-none-eabi-size target/thumbv7em-none-eabihf/release/jzf407vet6)",
+      "Bash(cd /Users/user/Documents/Proj/Rust/JZF407_RUST *)",
+      "Bash(python3 -c \"import sys; [print\\(l.rstrip\\(\\)\\) for l in sys.stdin]\")",
+      "Bash(xargs -I{} echo \"clippy issues: {}\")"
+    ],
+    "additionalDirectories": [
+      "/Users/user/Documents/Proj/Rust/JZF407_RUST"
     ]
   }
 }

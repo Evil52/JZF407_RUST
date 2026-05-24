@@ -14,7 +14,10 @@ target = "thumbv7em-none-eabihf"
 #   - Windows (MSVC): x86_64-pc-windows-msvc
 #   - Windows (GNU):  x86_64-pc-windows-gnu
 [alias]
-test-host = "test --target aarch64-apple-darwin"
+# Scope to the logic crate: the top-level jzf407vet6 bin is bare-metal (embassy-stm32,
+# panic_persist, …) and won't build for the host triple. Only `jzf407-logic` has
+# host-runnable unit tests.
+test-host = "test --target aarch64-apple-darwin -p jzf407-logic"
 
 [target.thumbv7em-none-eabihf]
 runner = "probe-rs run --chip STM32F407VETx"
