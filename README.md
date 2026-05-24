@@ -69,8 +69,8 @@ Rust's async model compiles down to state machines with no virtual dispatch and
 no heap allocation per task. Embassy's executor is interrupt-driven; when all
 tasks are waiting the core enters WFI sleep immediately with no FreeRTOS tick
 overhead. The result is code that is as fast as hand-written C but verifiably
-safe. The entire firmware fits in **~133 KB of the 512 KB flash** and uses
-**~31 KB of the 192 KB RAM**, leaving enormous headroom for future features.
+safe. The entire firmware fits in **~163 KB of the 512 KB flash** and uses
+**~42 KB of the 128 KB SRAM**, leaving substantial headroom for future features.
 
 ### Developer experience
 
@@ -107,7 +107,7 @@ confidence that it cannot silently break existing functionality.
 - [Memory map](#memory-map)
 - [Build, flash, test](#build-flash-test)
 - [Network configuration](#network-configuration)
-- [Web UI](#web-ui)
+- [Web UI & SSE](#web-ui--sse)
 - [MQTT interface](#mqtt-interface)
 - [Persistence & EEPROM layout](#persistence--eeprom-layout)
 - [Reset-reason reporting](#reset-reason-reporting)
@@ -151,7 +151,7 @@ confidence that it cannot silently break existing functionality.
 
 ## Task architecture
 
-Five Embassy tasks are spawned from `main()`; none of them block the executor.
+Eight Embassy tasks are spawned from `main()`; none of them block the executor.
 
 ```
 main()  — clock/peripheral init, EEPROM recovery, config load, then spawns:
@@ -160,8 +160,19 @@ main()  — clock/peripheral init, EEPROM recovery, config load, then spawns:
  ├── buttons_task         S1/S2 polled every 10 ms, 40 ms debounce → relay
  ├── net_task             embassy-net runner (drives the Ethernet MAC/DMA)
  ├── mqtt_task            MQTT client + reconnect loop + 10 s heartbeat publish
- └── web_task             HTTP server on :80 (raw TcpSocket)
+ ├── relay_task           monostable relay pulse driver (2 s on-time)
+ ├── web_task             HTTP server socket A on :80 — full router
+ └── web_task_b           HTTP server socket B on :80 — identical router
 ```
+
+**Two-socket web pool.** `web_task` and `web_task_b` are two near-identical tasks
+that each own their own static TCP buffers. Both delegate to the shared
+`serve_pool` → `serve_connection` router, so either socket can serve a normal
+request **or** hold the long-lived `GET /events` SSE stream. This avoids false
+404s: smoltcp distributes incoming connections arbitrarily and cannot know the
+request path before `accept` — with split roles (one socket SSE-only, one
+normal-only) the wrong socket would reply 404. Both sockets knowing all routes
+solves it. Sockets are allocated from `StackResources<8>`.
 
 **Shared state**
 
@@ -169,7 +180,7 @@ main()  — clock/peripheral init, EEPROM recovery, config load, then spawns:
 |--------|------|---------|
 | `OUTPUTS` | `SharedOutputs` = `Mutex<Option<OutputPins>>` | single owner of LED1/LED2/relay pins; all tasks drive them through it |
 | `RELAY_CHANGE` | `Signal<bool>` | buttons_task / web_task → mqtt_task: "relay changed, publish it" |
-| `MQTT_ONLINE` | `AtomicBool` | mqtt_task → web_task: true while broker connection is live |
+| `MQTT_ONLINE` | `AtomicBool` | mqtt_task → web_task/web_task_b: true while broker connection is live |
 | `EEPROM` | `Mutex<Option<Eeprom>>` | global AT24C02 handle shared by config + persistence |
 
 **Relay control flow (and why there is no echo loop)**
@@ -261,10 +272,15 @@ override it (e.g. `DEFMT_LOG=info`) to reduce log volume.
 cargo test -p jzf407-logic --target aarch64-apple-darwin
 ```
 
-59 tests: `debouncer` (11), `led_dispatch` (20), `config_parser` (23), `auth`
-(5). The `logic` crate has its own
+The `logic` crate has its own
 [`logic/.cargo/config.toml`](logic/.cargo/config.toml) so `cargo test` inside
 that directory also runs natively without the explicit `--target`.
+
+Or use the workspace alias (Apple Silicon):
+
+```bash
+cargo test-host
+```
 
 ---
 
@@ -290,33 +306,48 @@ defaults above, so you can never permanently lock yourself out via config.
 
 ---
 
-## Web UI
+## Web UI & SSE
 
-Open `http://<device-ip>/` (default `http://192.168.137.2/`). The page streams
-directly from flash-resident chunks (no large HTML buffer on the stack) and
-offers live relay control plus the full network/MQTT config form (including the
-MQTT and web-login credentials).
+Open `http://<device-ip>/` (default `http://192.168.137.2/`). The page uses a
+cyberpunk dashboard style (JetBrains Mono via Google Fonts CDN, fallback to
+system mono — zero flash cost). HTML is streamed from flash-resident string
+chunks; no heap, no large stack buffer.
 
-**HTTP Basic Auth.** Set a *Web Login* username/password on the page and every
-request — page, `/state` poll, and all POST actions — then requires an
-`Authorization: Basic` header; the browser prompts once and remembers it.
-Leaving **both** web fields blank disables the prompt (open page — the default,
-and how a device flashed before this feature behaves). The firmware never
-decodes the header: it builds the expected `base64(user:pass)` once at boot and
-compares (see [`logic/src/auth.rs`](logic/src/auth.rs), unit-tested on the host).
+**Live updates — SSE.** The dashboard subscribes to `GET /events`
+(`text/event-stream`). The device pushes a JSON diff every 150 ms when any
+state changes, plus a `: keepalive` comment every 15 s so the browser does not
+close the connection. The browser JS falls back to polling `/state` if SSE is
+unavailable. Because smoltcp distributes connections arbitrarily, both
+`web_task` and `web_task_b` serve `/events` as well as normal requests (see
+two-socket pool above).
 
-> ⚠️ Basic Auth over plain `http://` sends the credentials base64-encoded, **not
-> encrypted** — same caveat as MQTT above. It stops casual access from the open
-> internet but is not a substitute for TLS. Use a strong password and, if
-> possible, restrict the forwarded port by source IP.
+**Session auth.** A session cookie (`sid`) is issued on login and checked on
+every request including `/events`. The SSE stream does **not** refresh the
+session TTL (to prevent an open stream from keeping a session alive
+indefinitely). POST actions that change state require an active session;
+`/state` and `/events` reads do not refresh TTL but still require auth if
+credentials are configured.
+
+**HTTP Basic Auth (web login).** Set a *Web Login* username/password on the
+config page. The firmware builds the expected `base64(user:pass)` once at boot
+and compares — it never decodes the header at runtime (see
+[`logic/src/auth.rs`](logic/src/auth.rs), unit-tested on the host). Leaving
+both fields blank disables auth entirely (default after first flash).
+
+> ⚠️ Credentials travel base64-encoded over plain `http://`, **not encrypted**.
+> Sufficient for a trusted LAN; not a substitute for TLS on the public internet.
+> Restrict the forwarded port by source IP when exposing externally.
 
 | Method | Path | Action |
 |--------|------|--------|
-| `GET` | `/` | Render status + relay control + config form |
+| `GET` | `/` | Dashboard (status + relay control + config form) |
+| `GET` | `/state` | JSON snapshot of current state (used by JS fallback) |
+| `GET` | `/events` | SSE stream — push on diff, keepalive every 15 s |
 | `POST` | `/relay/on` | Energize relay, persist, publish `stm32/relay` → redirect `/` |
 | `POST` | `/relay/off` | De-energize relay, persist, publish `stm32/relay` → redirect `/` |
 | `POST` | `/save` | Validate + write config to EEPROM, then reboot |
 | `POST` | `/reboot` | Reboot with no config change |
+| `POST` | `/logout` | Invalidate session cookie → redirect to login |
 
 Both `/save` and `/reboot` use `safe_reboot()` (see below). Invalid form input
 returns `400` and does **not** write or reboot.
@@ -360,11 +391,18 @@ Boolean payloads accept `1`/`0`, `on`/`off`, `ON`/`OFF`, `true`/`false`.
 **Examples**
 
 ```bash
-mosquitto_sub -t 'stm32/#' -v          # watch everything
-mosquitto_pub -t stm32/relay   -m 1    # relay on
-mosquitto_pub -t stm32/led/all -m 0    # both LEDs off
-mosquitto_pub -t stm32/ping    -m x    # expect a stm32/pong
+# Subscribe (replace HOST/USER/PASS with your values)
+mosquitto_sub -h HOST -p 1883 -u USER -P PASS -t 'stm32/#' -v
+
+# Control
+mosquitto_pub -h HOST -p 1883 -u USER -P PASS -t stm32/relay   -m 1   # relay on
+mosquitto_pub -h HOST -p 1883 -u USER -P PASS -t stm32/led/1   -m 0   # LED1 off
+mosquitto_pub -h HOST -p 1883 -u USER -P PASS -t stm32/led/all -m 1   # both LEDs on
+mosquitto_pub -h HOST -p 1883 -u USER -P PASS -t stm32/ping    -m x   # → stm32/pong
+mosquitto_pub -h HOST -p 1883 -u USER -P PASS -t stm32/cmd/reboot -m 1
 ```
+
+Leave `-u`/`-P` out if the broker allows anonymous connections.
 
 ---
 
@@ -526,7 +564,8 @@ JZF407VET6/
 │   ├── outputs.rs          SharedOutputs mutex over LED1/LED2/relay (polarity lives here)
 │   ├── buttons.rs          S1/S2 polling + debounce → relay
 │   ├── mqtt.rs             MQTT client, topic handling, reconnect, grace period
-│   ├── web.rs              HTTP server (raw TcpSocket), config form, relay control
+│   ├── web.rs              HTTP server (raw TcpSocket), two-socket pool, router
+│   ├── sse.rs              SSE stream body — push on diff every 150 ms + keepalive
 │   ├── config.rs           NetworkConfig EEPROM load/save (firmware side)
 │   ├── persistence.rs      output-state RAM cache + EEPROM flush
 │   ├── eeprom.rs           AT24C02 driver over blocking I2C1
