@@ -3,7 +3,11 @@
     "allow": [
       "Bash(cargo expand *)",
       "Bash(cargo test-host *)",
-      "Bash(echo \"--- exit: $? ---\")"
+      "Bash(echo \"--- exit: $? ---\")",
+      "Bash(echo \"exit: $?\")",
+      "Bash(python3 -)",
+      "Bash(cargo size *)",
+      "Bash(python3 -c ' *)"
     ]
   }
 }

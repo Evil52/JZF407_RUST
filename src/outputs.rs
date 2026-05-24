@@ -44,6 +44,8 @@ pub fn relay_off() {
 /// Owns relay pulse timing. Idle until a `Pulse` arrives, then holds the relay
 /// HIGH for `RELAY_PULSE`. A new command (`Pulse` retriggers, `Off` cancels)
 /// arriving during the hold preempts the timer via `select`.
+/// After the pulse ends (timer or Off), signals MQTT with `false` so the broker
+/// state reflects the actual OFF state.
 #[embassy_executor::task]
 pub async fn relay_task(outputs: &'static SharedOutputs) {
     use embassy_futures::select::{select, Either};
@@ -59,15 +61,14 @@ pub async fn relay_task(outputs: &'static SharedOutputs) {
         loop {
             outputs.set_relay(true);
             match select(Timer::after(RELAY_PULSE), RELAY_TRIGGER.wait()).await {
-                // Pulse elapsed with no new trigger → drop and go idle.
                 Either::First(()) => break,
-                // Retriggered → restart the window.
                 Either::Second(RelayCmd::Pulse) => continue,
-                // Explicit off mid-pulse → drop immediately.
                 Either::Second(RelayCmd::Off) => break,
             }
         }
         outputs.set_relay(false);
+        // Notify MQTT that relay is now OFF so broker reflects actual state.
+        crate::mqtt::RELAY_CHANGE.signal(false);
     }
 }
 

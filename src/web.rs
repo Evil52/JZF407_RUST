@@ -13,10 +13,15 @@ const HTTP_OK: &str =
 // each poll reflects the live pin state.
 const HTTP_OK_JSON: &str =
     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
-const HTTP_303: &str = "HTTP/1.1 303 See Other\r\nLocation: /\r\nConnection: close\r\n\r\n";
+// Cookie clearing uses Max-Age=0 + a past Expires for max browser compatibility.
+// Path=/ must match the path the cookie was set with, or the browser keeps it.
+// Redirect to the dashboard (used when an authenticated client hits /login).
+const HTTP_303_HOME: &str = "HTTP/1.1 303 See Other\r\nLocation: /\r\nConnection: close\r\n\r\n";
+
+// Logout: clear the cookie and redirect to the login form.
 const HTTP_303_LOGOUT: &str = "HTTP/1.1 303 See Other\r\n\
-Set-Cookie: jzf_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict\r\n\
-Location: /\r\nConnection: close\r\n\r\n";
+Set-Cookie: jzf_session=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Strict\r\n\
+Location: /login\r\nConnection: close\r\n\r\n";
 const HTTP_400: &str = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nBad Request";
 const HTTP_404: &str = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\nNot Found";
 
@@ -26,17 +31,19 @@ const LOGIN_HEAD: &str = "<!DOCTYPE html><html lang='en'><head><meta charset='ut
 <meta name='viewport' content='width=device-width,initial-scale=1'><title>JZF407 — Login</title>\
 <style>\
 *{box-sizing:border-box;margin:0;padding:0}\
-body{font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;background:#eef2f6;color:#1e293b;display:flex;align-items:center;justify-content:center;min-height:100vh}\
-.login-box{background:#fff;border-radius:16px;box-shadow:0 4px 24px rgba(15,23,42,.08);padding:40px 32px;max-width:380px;width:100%;text-align:center}\
-.login-box h1{font-size:22px;font-weight:700;margin-bottom:6px}\
+body{font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:16px;\
+background:radial-gradient(1000px 600px at 80% -10%,rgba(167,139,250,.2),transparent),radial-gradient(800px 500px at -10% 10%,rgba(34,211,238,.15),transparent),#0a0e1a}\
+.login-box{background:rgba(20,27,45,.72);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border:1px solid rgba(148,163,184,.14);border-radius:18px;box-shadow:0 10px 40px rgba(0,0,0,.5);padding:40px 32px;max-width:380px;width:100%;text-align:center}\
+.login-box h1{font-size:24px;font-weight:700;margin-bottom:6px;background:linear-gradient(90deg,#22d3ee,#a78bfa);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}\
 .login-box .sub{color:#64748b;font-size:14px;margin-bottom:24px}\
-.login-box .err{background:#fef2f2;color:#b91c1c;border:1px solid #fecaca;border-radius:10px;padding:10px 14px;font-size:13px;font-weight:600;margin-bottom:16px}\
-.login-box input{display:block;width:100%;font:inherit;font-size:15px;padding:11px 14px;border:1px solid #cbd5e1;border-radius:10px;background:#f8fafc;margin-bottom:12px}\
-.login-box input:focus{outline:0;border-color:#4f46e5;background:#fff;box-shadow:0 0 0 3px rgba(79,70,229,.15)}\
-.login-box button{width:100%;font:inherit;font-weight:600;font-size:15px;border:0;border-radius:10px;padding:12px;cursor:pointer;background:#4f46e5;color:#fff;transition:background .15s}\
-.login-box button:hover{background:#4338ca}\
+.login-box .err{background:rgba(251,113,133,.12);color:#fb7185;border:1px solid rgba(251,113,133,.3);border-radius:10px;padding:10px 14px;font-size:13px;font-weight:600;margin-bottom:16px}\
+.login-box input{display:block;width:100%;font:inherit;font-size:15px;padding:12px 14px;border:1px solid rgba(148,163,184,.18);border-radius:10px;background:rgba(10,14,26,.6);color:#e2e8f0;margin-bottom:12px}\
+.login-box input:focus{outline:0;border-color:#22d3ee;background:rgba(10,14,26,.9);box-shadow:0 0 0 3px rgba(34,211,238,.18)}\
+.login-box input::placeholder{color:#475569}\
+.login-box button{width:100%;font:inherit;font-weight:700;font-size:15px;border:0;border-radius:10px;padding:13px;cursor:pointer;color:#0a0e1a;background:linear-gradient(90deg,#22d3ee,#a78bfa);transition:filter .15s,transform .12s}\
+.login-box button:hover{filter:brightness(1.12)}.login-box button:active{transform:scale(.98)}\
 </style></head><body>\
-<div class='login-box'><h1>🔐 JZF407</h1>\
+<div class='login-box'><h1>JZF407</h1>\
 <p class='sub'>Enter your credentials to continue</p>";
 
 /// Error message shown inside the login form on a failed login attempt.
@@ -49,58 +56,62 @@ const LOGIN_TAIL: &str = "<form method='post' action='/login'>\
 <button type='submit'>Sign In</button>\
 </form></div></body></html>";
 
-// 401 header — WWW-Authenticate triggers the browser's Basic Auth dialog.
-// We send this followed by the styled body above.
-const HTTP_401_HEADER: &str = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"JZF407\"\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n";
+// 401 + login form. No WWW-Authenticate header: the browser must render our
+// styled HTML form, never its native Basic Auth popup.
+const HTTP_401_LOGIN: &str = "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n";
 
-/// 401 response specifically when session expired — no Basic challenge,
-/// just redirect the user to re-login via the normal 401 flow.
-const HTTP_401_SESSION_EXPIRED: &str = "HTTP/1.1 401 Unauthorized\r\n\
-WWW-Authenticate: Basic realm=\"JZF407\"\r\n\
-Set-Cookie: jzf_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict\r\n\
+// Same as above but also expires a stale session cookie in the response.
+const HTTP_401_EXPIRE_COOKIE: &str = "HTTP/1.1 401 Unauthorized\r\n\
+Set-Cookie: jzf_session=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Strict\r\n\
 Content-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n";
 
 const PAGE_HEAD: &str = "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>\
 <meta name='viewport' content='width=device-width,initial-scale=1'><title>JZF407VET6</title>\
 <style>\
 *{box-sizing:border-box;margin:0;padding:0}\
-body{font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;background:#eef2f6;color:#1e293b;line-height:1.5;padding:24px 16px}\
-.wrap{max-width:460px;margin:0 auto}\
-.card{background:#fff;border-radius:16px;box-shadow:0 4px 24px rgba(15,23,42,.08);margin-bottom:18px;overflow:hidden}\
-.hd{background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;padding:22px 24px}\
-.hd h1{font-size:19px;font-weight:600}\
-.hd p{font-size:12px;opacity:.85;margin-top:3px}\
-.bd{padding:22px 24px}\
+:root{--cy:#22d3ee;--vi:#a78bfa;--ok:#34d399;--no:#fb7185;--mut:#64748b;--bd:rgba(148,163,184,.14)}\
+body{font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;color:#e2e8f0;line-height:1.5;padding:22px 14px;min-height:100vh;\
+background:radial-gradient(1200px 600px at 80% -10%,rgba(167,139,250,.18),transparent),radial-gradient(900px 500px at -10% 10%,rgba(34,211,238,.14),transparent),#0a0e1a}\
+.wrap{max-width:920px;margin:0 auto}\
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start}\
+.col{display:flex;flex-direction:column}\
+@media(max-width:720px){.grid{grid-template-columns:1fr}}\
+.card{background:rgba(20,27,45,.72);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border:1px solid var(--bd);border-radius:18px;box-shadow:0 10px 40px rgba(0,0,0,.45);margin-bottom:16px;overflow:hidden}\
+.col .card:last-child{margin-bottom:0}\
+.hd{position:relative;padding:20px 22px;border-bottom:1px solid var(--bd);background:linear-gradient(135deg,rgba(34,211,238,.12),rgba(167,139,250,.12))}\
+.hd h1{font-size:17px;font-weight:700;letter-spacing:.3px;display:flex;align-items:center;gap:9px}\
+.hd h1 .led{width:9px;height:9px;border-radius:50%;background:var(--cy);box-shadow:0 0 10px var(--cy);animation:pulse 2s infinite}\
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}\
+.hd p{font-size:11px;color:var(--mut);margin-top:3px;letter-spacing:.4px}\
+.clk{margin-top:14px;display:flex;align-items:baseline;gap:10px}\
+.clk #clk{font-size:34px;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:1px;background:linear-gradient(90deg,var(--cy),var(--vi));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;text-shadow:0 0 24px rgba(34,211,238,.25)}\
+.clk #dt{font-size:12px;color:var(--mut);font-weight:600}\
+.bd{padding:18px 22px}\
 .relay{display:flex;align-items:center;justify-content:space-between;gap:14px}\
 .relay .lbl{font-size:14px;font-weight:600}\
-.pill{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:700;padding:5px 12px;border-radius:999px;margin-top:4px}\
-.pill.on{background:#dcfce7;color:#15803d}\
-.pill.off{background:#fee2e2;color:#b91c1c}\
-.dot{width:7px;height:7px;border-radius:50%;background:currentColor}\
+.pill{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:700;padding:5px 12px;border-radius:999px}\
+.pill.on{background:rgba(52,211,153,.14);color:var(--ok);box-shadow:0 0 0 1px rgba(52,211,153,.3),0 0 14px rgba(52,211,153,.2)}\
+.pill.off{background:rgba(251,113,133,.12);color:var(--no);box-shadow:0 0 0 1px rgba(251,113,133,.25)}\
+.dot{width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 8px currentColor}\
 .leds{display:flex;gap:8px;margin-top:14px}\
-.btns{display:flex;gap:9px}\
-.kv{display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid #f1f5f9;font-size:13px}\
+.kv{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--bd);font-size:13px}\
 .kv:last-child{border-bottom:0}\
-.k{color:#64748b;font-weight:600}\
-.v{font-weight:600;font-variant-numeric:tabular-nums}\
-button{font:inherit;font-weight:600;font-size:14px;border:0;border-radius:10px;padding:10px 20px;cursor:pointer;transition:background .15s}\
-.bon{background:#16a34a;color:#fff}\
-.boff{background:#dc2626;color:#fff}\
-.sec{font-size:11px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;margin:18px 0 8px}\
+.k{color:var(--mut);font-weight:600}\
+.v{font-weight:600;font-variant-numeric:tabular-nums;color:#cbd5e1}\
+button{font:inherit;font-weight:600;font-size:14px;border:0;border-radius:11px;padding:11px 20px;cursor:pointer;transition:transform .12s,filter .15s}\
+button:active{transform:scale(.97)}button:hover{filter:brightness(1.12)}\
+.sec{font-size:10px;font-weight:700;color:var(--mut);text-transform:uppercase;letter-spacing:.1em;margin:18px 0 8px}\
 .sec.first{margin-top:0}\
-label{display:block;font-size:12px;font-weight:600;color:#64748b;margin:12px 0 5px}\
-input[type=text],input[type=number]{width:100%;font:inherit;font-size:15px;padding:10px 12px;border:1px solid #cbd5e1;border-radius:10px;background:#f8fafc}\
-input:focus{outline:0;border-color:#4f46e5;background:#fff;box-shadow:0 0 0 3px rgba(79,70,229,.15)}\
+label{display:block;font-size:12px;font-weight:600;color:var(--mut);margin:12px 0 5px}\
+input[type=text],input[type=number],input[type=password]{width:100%;font:inherit;font-size:15px;padding:10px 12px;border:1px solid var(--bd);border-radius:10px;background:rgba(10,14,26,.6);color:#e2e8f0}\
+input:focus{outline:0;border-color:var(--cy);background:rgba(10,14,26,.9);box-shadow:0 0 0 3px rgba(34,211,238,.18)}\
 .row{display:flex;gap:12px}\
 .row>div{flex:1}\
-.chk{display:flex;align-items:center;gap:9px;margin-top:16px}\
-.chk input{width:18px;height:18px;accent-color:#4f46e5}\
-.chk label{margin:0;font-size:14px;color:#1e293b}\
-.save{width:100%;background:#4f46e5;color:#fff;margin-top:20px;padding:12px}\
-.foot{padding:16px 24px;border-top:1px solid #eef2f6}\
-.reboot{width:100%;background:#fff;color:#dc2626;border:1px solid #fecaca;padding:11px}\
-.logout{width:100%;background:#fff;color:#4f46e5;border:1px solid #c7d2fe;padding:11px;margin-top:8px}\
-.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#1e293b;color:#fff;padding:10px 24px;border-radius:10px;font-size:13px;font-weight:600;z-index:999;opacity:0;transition:opacity .3s}\
+.save{width:100%;color:#0a0e1a;margin-top:20px;padding:13px;background:linear-gradient(90deg,var(--cy),var(--vi))}\
+.foot{padding:16px 22px;border-top:1px solid var(--bd);display:flex;flex-direction:column;gap:9px}\
+.reboot{width:100%;background:rgba(251,113,133,.1);color:var(--no);border:1px solid rgba(251,113,133,.3)}\
+.logout{width:100%;background:transparent;color:var(--cy);border:1px solid rgba(34,211,238,.35)}\
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:rgba(20,27,45,.95);border:1px solid var(--bd);color:#e2e8f0;padding:11px 24px;border-radius:12px;font-size:13px;font-weight:600;z-index:999;opacity:0;transition:opacity .3s;box-shadow:0 8px 30px rgba(0,0,0,.5)}\
 .toast.show{opacity:1}\
 </style></head><body><div class='wrap'>";
 
@@ -113,18 +124,28 @@ const PAGE_FOOT: &str = "<script>\
 function g(i){return document.getElementById(i)}\
 function pl(i,o,t){var e=g(i);if(e){e.className='pill '+(o?'on':'off');e.innerHTML=\"<span class='dot'></span>\"+t}}\
 function tx(i,v){var e=g(i);if(e){e.textContent=v}}\
-function fu(n){var d=n/86400|0,h=n%86400/3600|0,m=n%3600/60|0,s=n%60;return (d?d+'d ':'')+(h<10?'0':'')+h+':'+(m<10?'0':'')+m+':'+(s<10?'0':'')+s}\
-function p(){fetch('/state').then(function(r){return r.json()}).then(function(s){pl('rp',s.relay,s.relay?'ON':'OFF');pl('l1',s.led1,'LED1');pl('l2',s.led2,'LED2');pl('lk',s.link,s.link?'Up':'Down');pl('mq',s.mqtt,s.mqtt?'Online':'Offline');tx('ip',s.ip);tx('rst',s.rst);tx('up',fu(s.up))}).catch(function(){})}\
+function z(n){return(n<10?'0':'')+n}\
+function fu(n){var d=n/86400|0,h=n%86400/3600|0,m=n%3600/60|0,s=n%60;return (d?d+'d ':'')+z(h)+':'+z(m)+':'+z(s)}\
+var DAYS=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];\
+var MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];\
+function clock(){var n=new Date();tx('clk',z(n.getHours())+':'+z(n.getMinutes())+':'+z(n.getSeconds()));tx('dt',DAYS[n.getDay()]+', '+n.getDate()+' '+MON[n.getMonth()]+' '+n.getFullYear())}\
+var loggingOut=false;\
+function toLogin(){if(loggingOut)return;loggingOut=true;location.href='/login'}\
 var IDLE_TIMEOUT=900,lastActivity=Date.now();\
+var upBase=0,upAt=0;\
+function p(){if(loggingOut)return;var a=(Date.now()-lastActivity)/1000<30?'?active=1':'';fetch('/state'+a,{credentials:'same-origin'}).then(function(r){if(r.status===401){toLogin();return null}return r.ok?r.json():null}).then(function(s){if(!s)return;pl('rp',s.relay,s.relay?'ON':'OFF');pl('l1',s.led1,'LED1');pl('l2',s.led2,'LED2');pl('lk',s.link,s.link?'Up':'Down');pl('mq',s.mqtt,s.mqtt?'Online':'Offline');tx('ip',s.ip);tx('rst',s.rst);upBase=s.up;upAt=Date.now()}).catch(function(){})}\
 function resetIdle(){lastActivity=Date.now();if(g('toast'))g('toast').className='toast'}\
-['mousemove','keydown','touchstart','scroll'].forEach(function(e){document.addEventListener(e,resetIdle,{passive:true})});\
-function doLogout(){var f=document.createElement('form');f.method='post';f.action='/logout';document.body.appendChild(f);f.submit()}\
+['mousemove','keydown','touchstart','scroll','click'].forEach(function(e){document.addEventListener(e,resetIdle,{passive:true})});\
+function doLogout(){if(loggingOut)return;loggingOut=true;var f=document.createElement('form');f.method='post';f.action='/logout';document.body.appendChild(f);f.submit()}\
 setInterval(function(){\
+clock();\
+if(upAt)tx('up',fu(upBase+Math.floor((Date.now()-upAt)/1000)));\
+if(loggingOut)return;\
 var idle=(Date.now()-lastActivity)/1000;\
 if(idle>=IDLE_TIMEOUT){doLogout()}\
 else if(idle>=IDLE_TIMEOUT-60&&g('toast')){g('toast').className='toast show';g('toast').textContent='Session expires in '+(IDLE_TIMEOUT-Math.floor(idle))+'s — move mouse to stay'}\
-},10000);\
-setInterval(p,1200);p();\
+},1000);\
+clock();setInterval(p,1000);p();\
 </script><div id='toast' class='toast'></div></div></body></html>";
 
 async fn w(socket: &mut TcpSocket<'_>, s: &str) {
@@ -181,7 +202,6 @@ async fn send_page(
     cfg: &NetworkConfig,
     stack: Stack<'static>,
     reset: ResetReason,
-    session_token: Option<&str>,
 ) {
     let relay_on = crate::OUTPUTS.get_relay();
     let led1_on = crate::OUTPUTS.get_led(crate::LedId::Led1);
@@ -193,28 +213,20 @@ async fn send_page(
     let prefix = fmt_u8(cfg.prefix_len);
 
     w(socket, HTTP_OK).await;
-
-    // Set session cookie if the caller provided a fresh token
-    if let Some(tok) = session_token {
-        let mut cookie: HString<128> = HString::new();
-        let _ = core::fmt::Write::write_fmt(
-            &mut cookie,
-            format_args!(
-                "Set-Cookie: jzf_session={}; Path=/; Max-Age=1800; HttpOnly; SameSite=Strict\r\n",
-                tok
-            ),
-        );
-        w(socket, cookie.as_str()).await;
-    }
-    // Extra \r\n to finish headers
-    w(socket, "\r\n").await;
     w(socket, PAGE_HEAD).await;
 
-    // Header + live status. The pill ids (rp/l1/l2) are the hooks the polling
-    // script repaints; initial classes below just avoid a flash before first poll.
-    w(socket, "<div class='card'><div class='hd'><h1>JZF407VET6 Controller</h1><p>STM32F407 · Embassy · MQTT</p></div><div class='bd'><div class='relay'><div><div class='lbl'>Relay</div>").await;
+    // Header card: title + live clock/date (filled by JS from the browser's own
+    // Date(), so it ticks every second with no MCU clock and no page reload).
+    // The pill ids (rp/l1/l2) are the hooks the polling script repaints; initial
+    // classes below just avoid a flash before first poll.
+    // Relay has no buttons — controlled via MQTT only (stm32/relay).
+    // Full-width header, then a 2-column grid (collapses to 1 col on phones).
+    w(socket, "<div class='card'><div class='hd'><h1><span class='led'></span>JZF407VET6</h1><p>STM32F407 · Embassy · MQTT</p><div class='clk'><span id='clk'>--:--:--</span><span id='dt'></span></div></div></div>").await;
+
+    // ---- Left column: Relay/LED + Status ----
+    w(socket, "<div class='grid'><div class='col'><div class='card'><div class='bd'><div class='relay'><div><div class='lbl'>Relay (MQTT only)</div>").await;
     pill(socket, "rp", relay_on, if relay_on { "ON" } else { "OFF" }).await;
-    w(socket, "</div><div class='btns'><form method='post' action='/relay/on'><button class='bon'>ON</button></form><form method='post' action='/relay/off'><button class='boff'>OFF</button></form></div></div><div class='leds'>").await;
+    w(socket, "</div></div><div class='leds'>").await;
     pill(socket, "l1", led1_on, "LED1").await;
     pill(socket, "l2", led2_on, "LED2").await;
     w(socket, "</div></div></div>").await;
@@ -241,9 +253,10 @@ async fn send_page(
     w(socket, ip.as_str()).await;
     w(socket, "</span></div><div class='kv'><span class='k'>Uptime</span><span class='v' id='up'>—</span></div><div class='kv'><span class='k'>Last reset</span><span class='v' id='rst'>").await;
     w(socket, reset.as_str()).await;
-    w(socket, "</span></div></div></div>").await;
+    // Close Status card + left column, open right column for the config form.
+    w(socket, "</span></div></div></div></div><div class='col'>").await;
 
-    // Config form
+    // ---- Right column: config form ----
     w(socket, "<div class='card'><div class='bd'><form method='post' action='/save'><div class='sec first'>Network</div><label>IP address</label><input type='text' name='ip' value='").await;
     w(socket, ip.as_str()).await;
     w(
@@ -283,7 +296,7 @@ async fn send_page(
     .await;
     w(socket, cfg.mqtt_pass.as_str()).await;
 
-    // Web login (HTTP Basic Auth). Leaving BOTH blank disables the login prompt.
+    // Web login (form + session cookie). Leaving BOTH blank disables the login.
     w(socket, "'></div></div><div class='sec'>Web Login</div><div class='row'><div><label>Username</label><input type='text' name='wuser' value='").await;
     w(socket, cfg.web_user.as_str()).await;
     w(
@@ -293,7 +306,8 @@ async fn send_page(
     .await;
     w(socket, cfg.web_pass.as_str()).await;
 
-    w(socket, "'></div></div><button class='save'>Save Settings</button></form></div><div class='foot'><form method='post' action='/reboot'><button class='reboot'>Reboot Device</button></form><button class='logout' onclick='doLogout()'>Log Out</button></div></div>").await;
+    // Close form/.bd + .card, then .foot card, then right .col and the .grid.
+    w(socket, "'></div></div><button class='save'>Save Settings</button></form></div><div class='foot'><form method='post' action='/reboot'><button class='reboot'>Reboot Device</button></form><button class='logout' onclick='doLogout()'>Log Out</button></div></div></div></div>").await;
 
     w(socket, PAGE_FOOT).await;
     let _ = socket.flush().await;
@@ -333,17 +347,19 @@ fn push_u16_dec<const N: usize>(buf: &mut HString<N>, v: u16) {
     let _ = write!(buf, "{}", v);
 }
 
-/// Global session state: a 64-bit token stored as two 32-bit atomics (top and
-/// bottom halves) plus the Instant it was issued. When a user authenticates via
-/// Basic Auth, we mint a random token, set it as a cookie, and store it here. On
-/// subsequent requests the cookie is checked first — if valid (matching and not
-/// expired), Basic Auth is skipped entirely. Inactivity timeout: the session is
-/// refreshed on every authenticated request.
+/// Global session state: a 64-bit token (two 32-bit atomics: top/bottom halves)
+/// plus the uptime-seconds it was last refreshed. POST /login validates the
+/// submitted credentials, mints this token, and sets it as the `jzf_session`
+/// cookie. Every later request is authenticated by that cookie alone — there is
+/// no HTTP Basic Auth (browsers cache and auto-resend Basic credentials, which
+/// makes logout impossible). Logout clears the token here and expires the cookie.
+/// A single global session means one logged-in client at a time (fine for this
+/// device); a new login supersedes the previous one.
 static SESSION_TOKEN_HI: AtomicU32 = AtomicU32::new(0);
 static SESSION_TOKEN_LO: AtomicU32 = AtomicU32::new(0);
 static SESSION_CREATED: AtomicU32 = AtomicU32::new(0);
 
-const SESSION_TTL_SECS: u32 = 900; // 15 minutes
+const SESSION_TTL_SECS: u32 = 900; // 15 minutes idle timeout
 
 /// Mint a new session token (simple LCG-based pseudo-random, sufficient here).
 fn mint_session_token(seed: u64) -> u64 {
@@ -351,9 +367,14 @@ fn mint_session_token(seed: u64) -> u64 {
         .wrapping_add(1442695040888963407)
 }
 
-/// Validate the session cookie from a request. Returns `true` and refreshes the
-/// creation timestamp if the cookie is present, matches, and hasn't expired.
-fn validate_session(req: &str) -> bool {
+/// Validate the session cookie from a request. Returns `true` if the cookie is
+/// present, matches the live token, and is within the idle TTL.
+///
+/// `refresh` controls the sliding window: real navigation (GET /, POST /save…)
+/// passes `true` to extend the TTL; the background /state poller passes `false`,
+/// so an idle tab can't keep the session alive forever just by polling. This is
+/// what makes the server-side auto-logout reliable even if the JS timer fails.
+fn validate_session(req: &str, refresh: bool) -> bool {
     let token_hi = SESSION_TOKEN_HI.load(Ordering::Relaxed);
     let token_lo = SESSION_TOKEN_LO.load(Ordering::Relaxed);
     let token = ((token_hi as u64) << 32) | (token_lo as u64);
@@ -391,8 +412,10 @@ fn validate_session(req: &str) -> bool {
         return false;
     }
 
-    // Refresh the timestamp on every valid request (activity-based TTL)
-    SESSION_CREATED.store(now as u32, Ordering::Relaxed);
+    // Slide the TTL forward only on real activity (not background polling).
+    if refresh {
+        SESSION_CREATED.store(now as u32, Ordering::Relaxed);
+    }
     true
 }
 
@@ -473,29 +496,30 @@ pub async fn web_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: R
             }
         };
 
-        // Parse method+path early — /login must be reachable without a valid
-        // session or Basic Auth header.
+        // Parse method + target. Split the query string off the path so routing
+        // and TTL logic see a clean path (e.g. "/state?active=1" → "/state").
         let first_line = req.lines().next().unwrap_or("");
         let mut parts = first_line.split_whitespace();
         let method = parts.next().unwrap_or("");
-        let path = parts.next().unwrap_or("/");
+        let target = parts.next().unwrap_or("/");
+        let (path, query) = match target.split_once('?') {
+            Some((p, q)) => (p, q),
+            None => (target, ""),
+        };
 
         // --- Auth gate ---
-        // Priority: 1) auth disabled or valid session cookie  2) Basic Auth
-        //           3) login form  4) deny
-        let authenticated = if !auth_required || validate_session(req) {
-            true
-        } else if request_authorized(req, expected_token.as_str()) {
-            // Mint a fresh session token on successful Basic Auth, so the browser
-            // doesn't need to send the Authorization header on every request.
-            let new_token = mint_session_token(token_seed.wrapping_add(Instant::now().as_secs()));
-            SESSION_TOKEN_HI.store((new_token >> 32) as u32, Ordering::Relaxed);
-            SESSION_TOKEN_LO.store(new_token as u32, Ordering::Relaxed);
-            SESSION_CREATED.store(Instant::now().as_secs() as u32, Ordering::Relaxed);
-            true
-        } else {
-            false
-        };
+        // Form-login + session-cookie only (no HTTP Basic Auth). Browsers cache
+        // Basic credentials and auto-resend them, which makes logout impossible;
+        // a cookie session can be cleared server-side and in the browser, so
+        // logout actually works. Auth flow: valid cookie → in; otherwise the
+        // /login form mints a cookie on correct credentials.
+        //
+        // Idle-TTL sliding: real navigation always refreshes it. The /state poll
+        // refreshes it ONLY when the page reports recent user activity
+        // (?active=1) — so an open-but-abandoned tab can't keep the session alive
+        // by polling, but an actively-used page stays logged in.
+        let refresh_ttl = path != "/state" || query.contains("active=1");
+        let authenticated = !auth_required || validate_session(req, refresh_ttl);
 
         if !authenticated {
             // POST /login — validate form-submitted credentials (user & pass).
@@ -533,10 +557,8 @@ pub async fn web_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: R
                     socket.close();
                     continue;
                 }
-                // Credentials wrong — show login form with error.
-                // No WWW-Authenticate here: that header triggers the browser's
-                // native Basic Auth popup and would hide our styled error page.
-                w(&mut socket, "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n").await;
+                // Credentials wrong — re-show the login form with an error.
+                w(&mut socket, HTTP_401_LOGIN).await;
                 w(&mut socket, LOGIN_HEAD).await;
                 w(&mut socket, LOGIN_ERROR).await;
                 w(&mut socket, LOGIN_TAIL).await;
@@ -545,26 +567,17 @@ pub async fn web_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: R
                 continue;
             }
 
-            let has_session_cookie = extract_cookie(req, "jzf_session").is_some();
-            if has_session_cookie {
-                // Session was present but invalid/expired — clear and show login.
-                w(&mut socket, HTTP_401_SESSION_EXPIRED).await;
-                w(&mut socket, LOGIN_HEAD).await;
-                w(&mut socket, LOGIN_TAIL).await;
-            } else if path == "/" || path == "/login" {
-                // Main page without auth — show login form. No WWW-Authenticate
-                // header here, so the browser renders our HTML form instead of
-                // popping up its native Basic Auth dialog.
-                w(&mut socket, "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n").await;
-                w(&mut socket, LOGIN_HEAD).await;
-                w(&mut socket, LOGIN_TAIL).await;
+            // Not authenticated and not a login POST: show the login form.
+            // If a (now-invalid/expired) session cookie is present, expire it in
+            // the same response so the browser drops it. No WWW-Authenticate
+            // header anywhere — the browser must never pop its native Basic dialog.
+            if extract_cookie(req, "jzf_session").is_some() {
+                w(&mut socket, HTTP_401_EXPIRE_COOKIE).await;
             } else {
-                // API-style request (e.g. /state) — send WWW-Authenticate so
-                // programmatic clients can respond with Basic auth.
-                w(&mut socket, HTTP_401_HEADER).await;
-                w(&mut socket, LOGIN_HEAD).await;
-                w(&mut socket, LOGIN_TAIL).await;
+                w(&mut socket, HTTP_401_LOGIN).await;
             }
+            w(&mut socket, LOGIN_HEAD).await;
+            w(&mut socket, LOGIN_TAIL).await;
             let _ = socket.flush().await;
             socket.close();
             continue;
@@ -572,49 +585,29 @@ pub async fn web_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: R
 
         match (method, path) {
             ("GET", "/") => {
-                // Only include a session cookie if auth is required and this request
-                // was just authenticated via Basic Auth (not session). We detect
-                // this by checking if the request has an Authorization header.
-                let needs_cookie = auth_required && has_authorization_header(req);
-                let session_val = if needs_cookie {
-                    let tok_hi = SESSION_TOKEN_HI.load(Ordering::Relaxed) as u64;
-                    let tok_lo = SESSION_TOKEN_LO.load(Ordering::Relaxed) as u64;
-                    let tok = (tok_hi << 32) | tok_lo;
-                    let mut s: HString<24> = HString::new();
-                    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{}", tok));
-                    Some(s)
-                } else {
-                    None
-                };
-                send_page(
-                    &mut socket,
-                    &cfg,
-                    stack,
-                    reset_reason,
-                    session_val.as_ref().map(|s| s.as_str()),
-                )
-                .await;
+                // The session cookie is minted only by POST /login. Here we just
+                // render the page; the request already carried a valid cookie
+                // (auth gate passed), so no Set-Cookie is needed.
+                send_page(&mut socket, &cfg, stack, reset_reason).await;
                 // Graceful FIN so the browser gets a clean EOF, not a RST.
                 // Without this, drop() calls abort() → RST → fetch('/state')
                 // fails with ERR_CONNECTION_RESET and live updates stop working.
+                socket.close();
+            }
+            // Already authenticated but hitting /login (e.g. via back button or
+            // login when auth is disabled) — just send them to the dashboard.
+            ("GET", "/login") => {
+                let _ = socket.write_all(HTTP_303_HOME.as_bytes()).await;
+                let _ = socket.flush().await;
                 socket.close();
             }
             ("GET", "/state") => {
                 send_state(&mut socket, &cfg, stack, reset_reason).await;
                 socket.close();
             }
-            ("POST", "/relay/on") | ("POST", "/relay/off") => {
-                let on = path.ends_with("on");
-                // Relay is a momentary pulse: /relay/on fires a 2 s pulse,
-                // /relay/off cancels it. Timing is owned by relay_task.
-                if on { crate::outputs::pulse_relay() } else { crate::outputs::relay_off() }
-                // Tell mqtt_task to publish the new state to the broker.
-                crate::mqtt::RELAY_CHANGE.signal(on);
-                info!("WEB: relay {}", if on { "pulse" } else { "off" });
-                let _ = socket.write_all(HTTP_303.as_bytes()).await;
-                let _ = socket.flush().await;
-            }
             ("POST", "/logout") => {
+                // Clear server-side session first, then send redirect with
+                // expired cookie so the browser drops it too.
                 SESSION_TOKEN_HI.store(0, Ordering::Relaxed);
                 SESSION_TOKEN_LO.store(0, Ordering::Relaxed);
                 SESSION_CREATED.store(0, Ordering::Relaxed);
@@ -665,34 +658,6 @@ pub async fn web_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: R
             }
         }
     }
-}
-
-/// True if the request carries an `Authorization: Basic <token>` header whose
-/// token equals `expected`. Header name is matched case-insensitively (per RFC);
-/// the token is compared verbatim against the precomputed base64(user:pass).
-fn request_authorized(req: &str, expected: &str) -> bool {
-    const PREFIX: &str = "authorization:";
-    for line in req.lines() {
-        if line.len() < PREFIX.len() || !line[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
-            continue;
-        }
-        let val = line[PREFIX.len()..].trim();
-        if let Some(token) = val.strip_prefix("Basic ") {
-            return token.trim() == expected;
-        }
-    }
-    false
-}
-
-/// Check if request contains an Authorization header (to decide whether to set a session cookie).
-fn has_authorization_header(req: &str) -> bool {
-    const PREFIX: &str = "authorization:";
-    for line in req.lines() {
-        if line.len() >= PREFIX.len() && line[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
-            return true;
-        }
-    }
-    false
 }
 
 fn parse_form(body: &str, current: &NetworkConfig) -> Option<NetworkConfig> {
