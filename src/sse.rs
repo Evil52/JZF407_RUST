@@ -1,25 +1,9 @@
-//! Server-Sent Events (SSE) push for the dashboard.
+//! Server-Sent Events push for the dashboard.
 //!
-//! Why SSE and not WebSocket: SSE is just a long-lived HTTP/1.1 response with
-//! `Content-Type: text/event-stream`. No upgrade handshake, no frame parser —
-//! the server writes `data: {json}\n\n` whenever state changes and the browser
-//! delivers it to `EventSource.onmessage`. WebSocket would need a SHA-1/base64
-//! handshake plus frame (de)framing for no benefit here: the page only consumes
-//! pushes (control still goes through MQTT and POST forms).
-//!
-//! This module is just the stream body: `serve_events` takes an already-accepted,
-//! already-authenticated socket whose request was `GET /events`, and holds it
-//! open pushing state. Routing/auth live in `web::web_task`, which runs as a
-//! 2-socket pool so either socket can serve `/events` or a normal request — no
-//! request ever lands on a socket that can't handle it.
-//!
-//! State source of truth = the physical pins / atomics, exactly like `/state`.
-//! Rather than have every writer (relay_task, mqtt handle_event, link state…)
-//! fire a signal, this POLLS the snapshot every `POLL_MS` and pushes only when it
-//! differs from the last one sent. That catches *all* changes — including link
-//! up/down, which smoltcp flips internally with no writer to hook — and keeps
-//! in-air traffic to "on change only". Polling pin/atomic reads is nanoseconds;
-//! nothing goes out the wire while state is steady.
+//! SSE = long-lived HTTP/1.1 response (`text/event-stream`), no handshake or
+//! frame parser needed. State is polled every `POLL_MS` and pushed only on diff —
+//! this catches every change (including link up/down that smoltcp flips internally)
+//! without hooking every writer. Auth and routing live in `web::web_task`.
 
 use core::fmt::Write as _;
 use core::sync::atomic::Ordering;

@@ -41,7 +41,20 @@ impl ResetReason {
 }
 
 fn marker() -> &'static AtomicU32 {
-    // Safety: MARKER_ADDR is a valid, word-aligned CCM address, mapped NOLOAD.
+    // Safety: forming a `&'static AtomicU32` from a fixed address is sound here because:
+    //  * Reserved storage. The linker pins `_fault_marker = 0x1000FFF0` (see memory.x)
+    //    inside a NOLOAD CCM section, so the compiler never places any other object
+    //    there. Nothing else in the program ever takes a reference to this word, so the
+    //    shared `&` cannot alias a `&mut` to the same location — no UB from aliasing.
+    //  * Always mapped & aligned. CCM RAM (0x10000000..+64K) is always present on the
+    //    F407 (CPU-only, no DMA), and 0x1000FFF0 is word-aligned, so the read/write the
+    //    returned reference performs can never fault or be misaligned.
+    //  * No invalid bit patterns. After power-on the word is uninitialised, but every
+    //    32-bit value is a valid `AtomicU32`, so reading it is defined (we treat
+    //    non-tag garbage as "no marker" in read_and_clear). NOLOAD means a soft reset
+    //    preserves whatever we last stored, which is the whole point of the marker.
+    //  * No leak. We hand out a borrow of statically-reserved memory; nothing is
+    //    allocated, so there is nothing to leak.
     unsafe { &*(MARKER_ADDR as *const AtomicU32) }
 }
 

@@ -72,9 +72,7 @@ pub async fn mqtt_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: 
         cfg.broker_port,
     );
 
-    // Grace period: ignore retained messages for 3 s after connect
     const GRACE_MS: u64 = 3_000;
-    // Heartbeat every 10 s
     const HB_INTERVAL_MS: u64 = 10_000;
 
     let diag_str = reset_reason.as_str();
@@ -97,7 +95,6 @@ pub async fn mqtt_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: 
         mqtt_buf.fill(0);
         let mut bump = BumpBuffer::new(mqtt_buf);
 
-        // Client<'_, N, B, MAX_SUBSCRIBES, RECEIVE_MAX, SEND_MAX, MAX_SUB_IDS>
         let mut client = Client::<'_, _, _, 8, 4, 4, 1>::new(&mut bump);
 
         let client_id_str = core::str::from_utf8(cfg.client_id.as_ref())
@@ -115,13 +112,7 @@ pub async fn mqtt_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: 
             .keep_alive(KeepAlive::Seconds(core::num::NonZero::new(120).unwrap()))
             .will(will_opts);
 
-        // Authenticate with the broker if credentials are configured. Empty
-        // username/password => connect anonymously (pre-auth behaviour). The
-        // borrowed cfg.* strings outlive connect_opts (cfg lives for the whole
-        // task), so this is fine across the reconnect loop.
-        //
-        // NOTE: MQTT v3.1.1/v5 send these in the CLEAR. Over the public internet
-        // on port 1883 anyone sniffing the path can read them — see README.
+        // NOTE: credentials are sent in the CLEAR on port 1883 — see README.
         if !cfg.mqtt_user.is_empty() {
             if let Ok(u) = MqttString::from_str(cfg.mqtt_user.as_str()) {
                 connect_opts = connect_opts.user_name(u);
@@ -150,7 +141,7 @@ pub async fn mqtt_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: 
         // Publish diag (retained)
         let _ = publish_retained(&mut client, MQTT_TOPIC_DIAG, diag_str.as_bytes()).await;
 
-        // Subscribe to all control topics (fire-and-forget; suback arrives later in poll loop)
+        // fire-and-forget; suback arrives in the poll loop below
         let sub_opts = SubscriptionOptions::new();
         let mut sub_ok = true;
         for &topic in SUBSCRIBE_TOPICS {
@@ -176,20 +167,16 @@ pub async fn mqtt_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: 
         let mut next_heartbeat =
             embassy_time::Instant::now() + Duration::from_millis(HB_INTERVAL_MS);
 
-        // Main event loop
         loop {
-            // Check if time for heartbeat
             let now = embassy_time::Instant::now();
             if now >= next_heartbeat {
                 let _ = publish_qos0(&mut client, MQTT_TOPIC_HEARTBEAT, b"1").await;
                 next_heartbeat = now + Duration::from_millis(HB_INTERVAL_MS);
             }
 
-            // Calculate timeout until next scheduled action
             let hb_left = next_heartbeat.saturating_duration_since(embassy_time::Instant::now());
             let timeout = hb_left.min(Duration::from_secs(1));
 
-            // Poll for incoming MQTT packet OR relay change signal OR timeout
             let result = embassy_futures::select::select3(
                 client.poll(),
                 RELAY_CHANGE.wait(),
@@ -199,10 +186,7 @@ pub async fn mqtt_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: 
 
             match result {
                 embassy_futures::select::Either3::First(Ok(event)) => {
-                    if embassy_time::Instant::now() < grace_deadline {
-                        // still in grace period — ignore retained messages
-                    } else {
-                        // Process event; if Ping, publish pong using &mut client
+                    if embassy_time::Instant::now() >= grace_deadline {
                         handle_event(&mut client, event).await;
                     }
                 }
@@ -211,7 +195,6 @@ pub async fn mqtt_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: 
                     break;
                 }
                 embassy_futures::select::Either3::Second(relay_on) => {
-                    // Relay state change from button — publish to stm32/relay
                     let payload = if relay_on { b"1" } else { b"0" };
                     if publish_qos0(&mut client, MQTT_TOPIC_RELAY, payload)
                         .await
@@ -221,7 +204,6 @@ pub async fn mqtt_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: 
                     }
                 }
                 embassy_futures::select::Either3::Third(_) => {
-                    // timeout — ping keepalive
                     if client.ping().await.is_err() {
                         warn!("MQTT: ping failed");
                         break;

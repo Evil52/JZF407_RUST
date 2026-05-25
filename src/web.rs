@@ -25,10 +25,6 @@ Location: /login\r\nConnection: close\r\n\r\n";
 const HTTP_400: &str = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nBad Request";
 const HTTP_404: &str = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\nNot Found";
 
-/// Login form page parts. Split so the error message can be conditionally
-/// included (shown on failed POST /login, hidden on GET / or expired session).
-/// Same cyberpunk theme as the dashboard: HUD-bracketed code-window over the
-/// scanline/grain/vignette overlays, JetBrains Mono via CDN with mono fallback.
 const LOGIN_HEAD: &str = "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>\
 <meta name='viewport' content='width=device-width,initial-scale=1'><title>JZF407 // AUTH</title>\
 <link rel='preconnect' href='https://fonts.gstatic.com' crossorigin>\
@@ -68,9 +64,7 @@ button::after{bottom:-1px;right:-1px;border-left:none;border-top:none}\
 <div class='body'><h1>JZF<span class='ac'>407</span></h1>\
 <p class='sub'>// authorization required</p>";
 
-/// Error message shown inside the login form on a failed login attempt.
 const LOGIN_ERROR: &str = "<div class='err'>\u{2715} Invalid username or password</div>";
-/// Lockout message shown when too many failed attempts have been made.
 const LOGIN_LOCKED: &str = "<div class='err'>\u{26a0} Too many failed attempts \u{2014} locked for 60s</div>";
 
 /// Login form (after the optional error message).
@@ -80,21 +74,13 @@ const LOGIN_TAIL: &str = "<form method='post' action='/login'>\
 <button type='submit'>\u{25b8} Authenticate</button>\
 </form></div></div></body></html>";
 
-// 401 + login form. No WWW-Authenticate header: the browser must render our
-// styled HTML form, never its native Basic Auth popup.
+// No WWW-Authenticate header: forces browser to render our form, not the native Basic Auth popup.
 const HTTP_401_LOGIN: &str = "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n";
 
-// Same as above but also expires a stale session cookie in the response.
 const HTTP_401_EXPIRE_COOKIE: &str = "HTTP/1.1 401 Unauthorized\r\n\
 Set-Cookie: jzf_session=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Strict\r\n\
 Content-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n";
 
-// Cyberpunk "SIGNAL.EDGE" theme adapted from the Claude Design mock: JetBrains
-// Mono via Google Fonts (falls back to the system monospace offline — flash
-// stays tiny, no fonts embedded), neon cyan/magenta on near-black, scanlines +
-// grain + vignette + gridline overlays, HUD corner brackets, and a code-window
-// frame for the config form. The heavy animated chip SVG / PCB traces from the
-// mock are intentionally omitted; live status widgets take that space instead.
 const PAGE_HEAD: &str = "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>\
 <meta name='viewport' content='width=device-width,initial-scale=1'><title>JZF407 // SIGNAL.EDGE</title>\
 <link rel='preconnect' href='https://fonts.gstatic.com' crossorigin>\
@@ -283,13 +269,8 @@ async fn send_state(
     let _ = socket.flush().await;
 }
 
-/// Stream the dashboard page directly to the socket. Streaming flash-resident
-/// chunks avoids building a multi-KB HTML buffer in RAM. Layout mirrors the
-/// "SIGNAL.EDGE" mock: topbar → hero (eyebrow/title/lede/specs) → 2-column grid
-/// (left = live I/O + telemetry windows, right = config code-window) → footer.
-/// All numbers are this board's real values (F407 @168 MHz, 512K/128K), not the
-/// mock's fictional M7. Pill/text ids (rp/l1/l2/lk/mq/ip/up) are the hooks the
-/// SSE/poll script repaints live.
+/// Stream the dashboard page to the socket in chunks (avoids a multi-KB buffer in RAM).
+/// Pill/text ids (rp/l1/l2/lk/mq/ip/up) are the hooks the SSE/poll script repaints live.
 async fn send_page(
     socket: &mut TcpSocket<'_>,
     cfg: &NetworkConfig,
@@ -310,21 +291,16 @@ async fn send_page(
     w(socket, HTTP_OK).await;
     w(socket, PAGE_HEAD).await;
 
-    // ---- Top status bar. Brand + section coords on the left; live LINK/MQTT
-    // pills + browser clock on the right (clock filled by JS from Date()). ----
     w(socket, "<div class='topbar'><div class='left'><span class='brand'>JZF407 // SIGNAL.EDGE</span><span>SEC \u{25b8} STM32F407VET6</span></div>\
 <div class='brand' style='font-size:10px;letter-spacing:.4em'>\u{2014} REV 2.2 \u{2014}</div>\
 <div class='right'><span>UPLINK ").await;
     w(socket, if link_up { "<span class='ok'>\u{25cf}</span> NOMINAL" } else { "<span class='hot'>\u{25cf}</span> DOWN" }).await;
     w(socket, "</span><span>BUS <span class='hot'>\u{25cf}</span> 168MHZ</span><span id='clk'>--:--:--</span></div></div>").await;
 
-    // ---- Hero: eyebrow + glitch title + lede + real-spec grid ----
     w(socket, "<main><span class='eyebrow'>Arm\u{00ae} Cortex\u{00ae}-M4F // Embassy async firmware</span>\
 <h1 class='title'>JZF<span class='slash'>/</span><span class='accent'>407</span></h1>\
 <p class='lede'>STM32F407VET6 on the Embassy async executor \u{2014} <b>real-time GPIO, Ethernet, and MQTT</b> over a smoltcp stack. Relay drives a <span class='pink'>2 s monostable pulse</span>, LEDs persist to EEPROM, and this page streams live state over <b>Server-Sent Events</b> \u{2014} no polling, instant updates.</p>").await;
 
-    // Spec grid — this board's actual silicon, not the mock's numbers.
-    // uptime cell (id=up) is filled live by the script.
     w(socket, "<div class='specs bracketed'><span class='bk1'></span><span class='bk2'></span>\
 <div class='spec'><div class='k'>core</div><div class='v'>M4F<span class='u'>@168</span></div><div class='sub'>Cortex-M4 + FPU</div></div>\
 <div class='spec'><div class='k'>flash</div><div class='v'>512<span class='u'>KB</span></div><div class='sub'>~28% used</div></div>\
@@ -333,10 +309,8 @@ async fn send_page(
     w(socket, reset.as_str()).await;
     w(socket, "</div></div></div>").await;
 
-    // ---- 2-column grid: left = I/O + telemetry, right = config ----
     w(socket, "<div class='grid'><div>").await;
 
-    // I/O window (relay + LEDs). Relay is MQTT-only (stm32/relay) → 2 s pulse.
     w(socket, "<div class='section-num'><span>0X01</span><span class='bar'></span><span class='mg'>// I/O STATE</span></div>\
 <div class='win'><span class='bk1'></span><span class='bk2'></span>\
 <div class='chrome'><span class='path'>gpio<span class='slash'>/</span>outputs</span><span class='lights'><i></i><i></i><i></i></span></div>\
@@ -349,7 +323,6 @@ async fn send_page(
     pill(socket, "l2", led2_on, "LED2").await;
     w(socket, "</div></div></div>").await;
 
-    // Telemetry window. lk/mq pills + ip text repaint live.
     w(socket, "<div class='section-num'><span>0X02</span><span class='bar'></span><span class='mg'>// LINK</span></div>\
 <div class='win'><span class='bk1'></span><span class='bk2'></span>\
 <div class='chrome'><span class='path'>net<span class='slash'>/</span>status</span><span class='lights'><i></i><i></i><i></i></span></div>\
@@ -362,7 +335,6 @@ async fn send_page(
     w(socket, ip.as_str()).await;
     w(socket, "</span></div></div></div></div>").await;
 
-    // ---- Right column: config code-window ----
     w(socket, "<div><div class='section-num'><span>0X03</span><span class='bar'></span><span class='mg'>// CONFIG</span></div>\
 <div class='win'><span class='bk1'></span><span class='bk2'></span>\
 <div class='chrome'><span class='path'>etc<span class='slash'>/</span>config.toml</span><span>EEPROM</span></div>\
@@ -380,20 +352,16 @@ async fn send_page(
     w(socket, "'></div></div><label>Client ID</label><input type='text' name='id' value='").await;
     w(socket, cfg.client_id.as_str()).await;
 
-    // MQTT broker credentials (sent in the CONNECT packet). Empty = anonymous.
     w(socket, "'><div class='sec'>MQTT Auth</div><div class='row'><div><label>Username</label><input type='text' name='muser' value='").await;
     w(socket, cfg.mqtt_user.as_str()).await;
     w(socket, "'></div><div><label>Password</label><input type='password' name='mpass' value='").await;
     w(socket, cfg.mqtt_pass.as_str()).await;
 
-    // Web login (form + session cookie). Leaving BOTH blank disables the login.
     w(socket, "'></div></div><div class='sec'>Web Login</div><div class='row'><div><label>Username</label><input type='text' name='wuser' value='").await;
     w(socket, cfg.web_user.as_str()).await;
     w(socket, "'></div><div><label>Password</label><input type='password' name='wpass' value='").await;
     w(socket, cfg.web_pass.as_str()).await;
 
-    // Close form inputs, Save button (inside form), then footer with Reboot +
-    // Logout. Close .wbody / .win / right grid col / .grid / main.
     w(socket, "'></div></div><button class='btn save'>\u{25b8} Save &amp; Reboot</button></form></div>\
 <div class='foot'><form method='post' action='/reboot' style='flex:1'><button class='btn reboot'>Reboot</button></form>\
 <button class='btn' style='flex:1' onclick='doLogout()'>Log Out</button></div>\
@@ -593,12 +561,7 @@ async fn serve_pool(
     tx_buf: &mut [u8],
     req_buf: &mut [u8],
 ) {
-    // Form-login + session cookie (no HTTP Basic Auth — browsers cache and
-    // auto-resend Basic credentials, making logout impossible). Auth is enabled
-    // only when a web username or password is set; an all-empty pair leaves the
-    // page open (matches a fresh/upgraded device on a trusted LAN). The expected
-    // token is derived from the credentials once here and compared against what
-    // POST /login submits; on a match we mint the session cookie.
+    // Auth disabled when both web_user and web_pass are empty (open LAN device).
     let auth_required = !cfg.web_user.is_empty() || !cfg.web_pass.is_empty();
     let expected_token =
         jzf407_logic::auth::basic_token(cfg.web_user.as_str(), cfg.web_pass.as_str());
@@ -692,7 +655,6 @@ async fn serve_connection(
         let authenticated = !auth_required || validate_session(req, refresh_ttl);
 
         if !authenticated {
-            // POST /login — validate form-submitted credentials (user & pass).
             if method == "POST" && path == "/login" {
                 let now = Instant::now().as_secs();
                 let fails = LOGIN_FAIL_COUNT.load(Ordering::Relaxed);
@@ -712,7 +674,6 @@ async fn serve_connection(
                     return;
                 }
 
-                // If lockout window expired, reset the counter.
                 if fails >= LOGIN_MAX_FAILS {
                     LOGIN_FAIL_COUNT.store(0, Ordering::Relaxed);
                 }
@@ -731,7 +692,6 @@ async fn serve_connection(
                 };
 
                 if login_ok {
-                    // Credentials correct — reset fail counter, mint session, redirect.
                     LOGIN_FAIL_COUNT.store(0, Ordering::Relaxed);
                     let new_token =
                         mint_session_token(token_seed.wrapping_add(Instant::now().as_secs()));
@@ -752,7 +712,6 @@ async fn serve_connection(
                     return;
                 }
 
-                // Credentials wrong — increment fail counter, apply delay, show error.
                 let new_fails = LOGIN_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
                 LOGIN_FAIL_LAST.store(Instant::now().as_secs() as u32, Ordering::Relaxed);
                 warn!("WEB: failed login attempt #{}", new_fails);
@@ -803,9 +762,6 @@ async fn serve_connection(
 
         match (method, path) {
             ("GET", "/") => {
-                // The session cookie is minted only by POST /login. Here we just
-                // render the page; the request already carried a valid cookie
-                // (auth gate passed), so no Set-Cookie is needed.
                 send_page(socket, cfg, stack, reset_reason).await;
                 // Graceful FIN so the browser gets a clean EOF, not a RST.
                 // Without this, drop() calls abort() → RST → fetch('/state')
@@ -819,8 +775,6 @@ async fn serve_connection(
                 crate::sse::serve_events(socket, stack).await;
                 socket.close();
             }
-            // Already authenticated but hitting /login (e.g. via back button or
-            // login when auth is disabled) — just send them to the dashboard.
             ("GET", "/login") => {
                 let _ = socket.write_all(HTTP_303_HOME.as_bytes()).await;
                 let _ = socket.flush().await;
@@ -831,8 +785,6 @@ async fn serve_connection(
                 socket.close();
             }
             ("POST", "/logout") => {
-                // Clear server-side session first, then send redirect with
-                // expired cookie so the browser drops it too.
                 SESSION_TOKEN_HI.store(0, Ordering::Relaxed);
                 SESSION_TOKEN_LO.store(0, Ordering::Relaxed);
                 SESSION_CREATED.store(0, Ordering::Relaxed);
