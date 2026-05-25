@@ -3,21 +3,10 @@ target = "thumbv7em-none-eabihf"
 
 # `build.target` above forces the embedded triple onto every cargo command, so a
 # plain `cargo test` tries to build the test harness for bare-metal and fails
-# with E0463 (no `test` crate). The logic crate's tests are host tests — run them
-# with `cargo test-host`.
-#
-# The triple below is hardcoded for Apple Silicon (aarch64-apple-darwin). On a
-# different host, change it to your own triple (find it with `rustc -vV | grep host`)
-# and make sure that target's std is installed (`rustup target add <triple>`):
-#   - Intel macOS:   x86_64-apple-darwin
-#   - Linux x86_64:  x86_64-unknown-linux-gnu
-#   - Windows (MSVC): x86_64-pc-windows-msvc
-#   - Windows (GNU):  x86_64-pc-windows-gnu
-[alias]
-# Scope to the logic crate: the top-level jzf407vet6 bin is bare-metal (embassy-stm32,
-# panic_persist, …) and won't build for the host triple. Only `jzf407-logic` has
-# host-runnable unit tests.
-test-host = "test --target aarch64-apple-darwin -p jzf407-logic"
+# with E0463 (no `test` crate). The logic crate's tests are HOST tests — run them
+# with the wrapper scripts, which auto-detect the host triple:
+#   Windows:      .\test.ps1
+#   macOS/Linux:  ./test.sh
 
 [target.thumbv7em-none-eabihf]
 runner = "probe-rs run --chip STM32F407VETx"

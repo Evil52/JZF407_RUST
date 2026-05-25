@@ -1,0 +1,13 @@
+{
+    // The workspace .cargo/config.toml forces the embedded triple. rust-analyzer
+    // honours it, so the bare-metal firmware crate analyses correctly out of the box.
+    // No target override here: forcing a host triple would break the firmware crate
+    // (embassy-stm32 etc. don't build for the host), and forcing the embedded triple
+    // would break the logic crate's host tests (no `test`/`std`). Letting RA use the
+    // config default keeps the firmware (the bulk of the code) correct.
+    "rust-analyzer.check.command": "clippy",
+    "rust-analyzer.cargo.buildScripts.enable": true,
+    "rust-analyzer.procMacro.enable": true,
+    "rust-analyzer.imports.granularity.group": "module",
+    "rust-analyzer.cargo.features": "all"
+}
