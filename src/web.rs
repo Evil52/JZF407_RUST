@@ -598,6 +598,20 @@ async fn serve_pool(
             token_seed,
         )
         .await;
+
+        // Graceful TCP shutdown so the browser sees a clean FIN, not a RST.
+        // `close()` only QUEUES the FIN; if we drop the socket immediately (or
+        // reuse the rx/tx buffers via TcpSocket::new on the next iteration)
+        // smoltcp aborts the connection and sends RST. We have to wait for the
+        // FIN to actually leave the wire. `flush()` returns once the send queue
+        // (incl. FIN) is drained or the peer acks. The select() bounds it so a
+        // misbehaving peer can't park this socket forever.
+        socket.close();
+        let _ = embassy_futures::select::select(
+            socket.flush(),
+            Timer::after(Duration::from_millis(500)),
+        )
+        .await;
     }
 }
 
