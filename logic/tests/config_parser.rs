@@ -124,3 +124,53 @@ fn legacy_image_upgrades_to_empty_credentials() {
     assert!(r.web_user.is_empty());
     assert!(r.web_pass.is_empty());
 }
+
+
+// ---- malformed EEPROM images / boot safety ----
+
+#[test]
+fn all_valid_prefixes_survive_round_trip() {
+    for prefix in 1..=32 {
+        let mut cfg = NetworkConfig::default();
+        cfg.prefix_len = prefix;
+        let restored = NetworkConfig::from_bytes(&cfg.to_bytes()).unwrap();
+        assert_eq!(restored.prefix_len, prefix);
+    }
+}
+
+#[test]
+fn invalid_prefixes_from_eeprom_are_rejected() {
+    for prefix in [0, 33, 64, 255] {
+        let mut bytes = NetworkConfig::default().to_bytes();
+        bytes[8] = prefix;
+        assert!(
+            NetworkConfig::from_bytes(&bytes).is_none(),
+            "prefix_len={prefix} must not reach Ipv4Cidr::new at boot"
+        );
+    }
+}
+
+#[test]
+fn zero_broker_port_from_eeprom_is_rejected() {
+    let mut bytes = NetworkConfig::default().to_bytes();
+    bytes[20] = 0;
+    bytes[21] = 0;
+    assert!(NetworkConfig::from_bytes(&bytes).is_none());
+}
+
+#[test]
+fn invalid_utf8_client_id_rejects_whole_config() {
+    let mut bytes = NetworkConfig::default().to_bytes();
+    bytes[23] = 0xFF;
+    bytes[24] = 0;
+    assert!(NetworkConfig::from_bytes(&bytes).is_none());
+}
+
+#[test]
+fn every_magic_byte_is_checked() {
+    for index in 0..4 {
+        let mut bytes = NetworkConfig::default().to_bytes();
+        bytes[index] ^= 0x55;
+        assert!(NetworkConfig::from_bytes(&bytes).is_none());
+    }
+}

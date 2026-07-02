@@ -4,4 +4,5 @@
 pub mod auth;
 pub mod debouncer;
 pub mod led_dispatch;
+pub mod web_form;
 pub mod config;

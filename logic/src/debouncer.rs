@@ -3,6 +3,8 @@
 
 pub const SAMPLE_PERIOD_MS: u64 = 10;
 pub const STABLE_COUNT:      u8  = 4; // 4 × 10ms = 40ms stable
+const STABLE_MASK: u8 = ((1u16 << STABLE_COUNT) - 1) as u8;
+const _: () = assert!(STABLE_COUNT > 0 && STABLE_COUNT <= 8);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Edge {
@@ -27,8 +29,9 @@ impl Debouncer {
     /// Feed one raw sample. Returns `Some(Edge)` on state change.
     pub fn update(&mut self, raw: bool) -> Option<Edge> {
         self.history = (self.history << 1) | (raw as u8);
-        let all_ones  = self.history & 0x0F == 0x0F;
-        let all_zeros = self.history & 0x0F == 0x00;
+        let window = self.history & STABLE_MASK;
+        let all_ones  = window == STABLE_MASK;
+        let all_zeros = window == 0;
 
         if all_ones && !self.stable {
             self.stable = true;

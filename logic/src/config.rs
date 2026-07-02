@@ -21,9 +21,11 @@
 //! the existing network config and simply boots with no credentials configured
 //! (anonymous MQTT + open web page) — exactly the pre-auth behaviour.
 //!
-//! Validation is magic-only: a wrong magic falls back to Default. There is no
-//! CRC — a torn EEPROM write can yield a struct that passes the magic check, so
-//! callers treat a bad-looking config by reverting to defaults, not by trusting it.
+//! Validation is deliberately conservative: a wrong magic, invalid CIDR prefix,
+//! zero broker port, or invalid client_id all make parsing fail so the firmware
+//! falls back to Default. There is no CRC — a torn EEPROM write can still yield
+//! a plausible struct, so callers treat a bad-looking config by reverting to
+//! defaults, not by trusting it.
 //!
 //! These are plain-data structs with no hardware deps, so (de)serialisation is
 //! unit-tested natively on the host — see tests/config_parser.rs.
@@ -129,14 +131,23 @@ impl NetworkConfig {
             return None;
         }
 
+        let prefix_len = b[8];
+        if !(1..=32).contains(&prefix_len) {
+            return None;
+        }
+
         let port = ((b[20] as u16) << 8) | (b[21] as u16);
+        if port == 0 {
+            return None;
+        }
+
         let id_bytes = &b[23..47];
         let end = id_bytes.iter().position(|&c| c == 0).unwrap_or(24);
         let id = core::str::from_utf8(&id_bytes[..end]).ok()?;
 
         Some(Self {
             ip: [b[4], b[5], b[6], b[7]],
-            prefix_len: b[8],
+            prefix_len,
             gateway: [b[12], b[13], b[14], b[15]],
             broker_ip: [b[16], b[17], b[18], b[19]],
             broker_port: port,

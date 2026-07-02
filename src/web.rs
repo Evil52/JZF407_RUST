@@ -6,6 +6,7 @@ use embassy_time::{Duration, Instant, Timer};
 use embedded_io_async::Write;
 use heapless::String as HString;
 use jzf407_logic::config::{parse_ipv4, parse_port, NetworkConfig};
+use jzf407_logic::web_form::{form_url_decode, html_escape_attr, secret_from_form};
 
 const HTTP_OK: &str =
     "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n";
@@ -226,6 +227,12 @@ async fn w(socket: &mut TcpSocket<'_>, s: &str) {
     let _ = socket.write_all(s.as_bytes()).await;
 }
 
+async fn write_attr(socket: &mut TcpSocket<'_>, s: &str) {
+    if let Ok(escaped) = html_escape_attr::<256>(s) {
+        w(socket, escaped.as_str()).await;
+    }
+}
+
 /// Stream one status pill: `<span class='pill on|off' id=...><dot>TEXT</span>`.
 /// `id` lets the client-side poller find and repaint it (see PAGE_FOOT script).
 async fn pill(socket: &mut TcpSocket<'_>, id: &str, on: bool, text: &str) {
@@ -350,17 +357,17 @@ async fn send_page(
     w(socket, "'></div><div><label>Port</label><input type='number' name='port' value='").await;
     w(socket, port.as_str()).await;
     w(socket, "'></div></div><label>Client ID</label><input type='text' name='id' value='").await;
-    w(socket, cfg.client_id.as_str()).await;
+    write_attr(socket, cfg.client_id.as_str()).await;
 
     w(socket, "'><div class='sec'>MQTT Auth</div><div class='row'><div><label>Username</label><input type='text' name='muser' value='").await;
-    w(socket, cfg.mqtt_user.as_str()).await;
-    w(socket, "'></div><div><label>Password</label><input type='password' name='mpass' value='").await;
-    w(socket, cfg.mqtt_pass.as_str()).await;
+    write_attr(socket, cfg.mqtt_user.as_str()).await;
+    w(socket, "'></div><div><label>Password</label><input type='password' name='mpass' value='' placeholder='").await;
+    w(socket, if cfg.mqtt_pass.is_empty() { "" } else { "leave blank to keep" }).await;
 
     w(socket, "'></div></div><div class='sec'>Web Login</div><div class='row'><div><label>Username</label><input type='text' name='wuser' value='").await;
-    w(socket, cfg.web_user.as_str()).await;
-    w(socket, "'></div><div><label>Password</label><input type='password' name='wpass' value='").await;
-    w(socket, cfg.web_pass.as_str()).await;
+    write_attr(socket, cfg.web_user.as_str()).await;
+    w(socket, "'></div><div><label>Password</label><input type='password' name='wpass' value='' placeholder='").await;
+    w(socket, if cfg.web_pass.is_empty() { "" } else { "leave blank to keep" }).await;
 
     w(socket, "'></div></div><button class='btn save'>\u{25b8} Save &amp; Reboot</button></form></div>\
 <div class='foot'><form method='post' action='/reboot' style='flex:1'><button class='btn reboot'>Reboot</button></form>\
@@ -856,7 +863,7 @@ fn parse_form(body: &str, current: &NetworkConfig) -> Option<NetworkConfig> {
         let mut kv = pair.splitn(2, '=');
         let key = kv.next().unwrap_or("").trim();
         let val = kv.next().unwrap_or("").trim();
-        let val = url_decode(val);
+        let val = form_url_decode::<64>(val).ok()?;
 
         match key {
             "ip" => {
@@ -889,13 +896,13 @@ fn parse_form(body: &str, current: &NetworkConfig) -> Option<NetworkConfig> {
                 cfg.mqtt_user = HString::try_from(val.as_str()).ok()?;
             }
             "mpass" => {
-                cfg.mqtt_pass = HString::try_from(val.as_str()).ok()?;
+                cfg.mqtt_pass = secret_from_form(&current.mqtt_pass, val.as_str()).ok()?;
             }
             "wuser" => {
                 cfg.web_user = HString::try_from(val.as_str()).ok()?;
             }
             "wpass" => {
-                cfg.web_pass = HString::try_from(val.as_str()).ok()?;
+                cfg.web_pass = secret_from_form(&current.web_pass, val.as_str()).ok()?;
             }
             _ => {}
         }
@@ -903,43 +910,6 @@ fn parse_form(body: &str, current: &NetworkConfig) -> Option<NetworkConfig> {
     Some(cfg)
 }
 
-fn url_decode(s: &str) -> HString<64> {
-    let mut out = HString::<64>::new();
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if c == b'+' {
-            let _ = out.push(' ');
-            i += 1;
-        } else if c == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
-                let byte = (h << 4) | l;
-                // Only single-byte UTF-8 (ASCII) is representable here; matches prior behavior.
-                if byte < 0x80 {
-                    let _ = out.push(byte as char);
-                }
-                i += 3;
-            } else {
-                let _ = out.push(c as char);
-                i += 1;
-            }
-        } else {
-            let _ = out.push(c as char);
-            i += 1;
-        }
-    }
-    out
-}
-
-fn hex_digit(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
 
 /// Extract url-decoded `user` and `pass` values from a POST /login form body.
 fn parse_login_form(body: &str) -> (Option<HString<64>>, Option<HString<64>>) {
@@ -950,8 +920,8 @@ fn parse_login_form(body: &str) -> (Option<HString<64>>, Option<HString<64>>) {
         let key = kv.next().unwrap_or("");
         let val = kv.next().unwrap_or("");
         match key {
-            "user" => user = Some(url_decode(val)),
-            "pass" => pass = Some(url_decode(val)),
+            "user" => user = form_url_decode::<64>(val).ok(),
+            "pass" => pass = form_url_decode::<64>(val).ok(),
             _ => {}
         }
     }

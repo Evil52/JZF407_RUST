@@ -1,7 +1,7 @@
 // Native unit tests for the debouncer — no embedded dependencies.
 // Run with: cargo test --test debouncer
 
-use jzf407_logic::debouncer::{Debouncer, Edge};
+use jzf407_logic::debouncer::{Debouncer, Edge, STABLE_COUNT};
 
 #[test]
 fn idle_produces_no_edge() {
@@ -103,4 +103,61 @@ fn glitch_between_stable_transitions() {
     for _ in 0..3 { assert_eq!(d.update(true), None); }
     let e = d.update(true);
     assert_eq!(e, Some(Edge::Rising));
+}
+
+
+#[test]
+fn exhaustive_sequences_do_not_rise_before_stable_count() {
+    let max_len = 8usize;
+    for len in 0..=max_len {
+        for bits in 0usize..(1usize << len) {
+            let mut d = Debouncer::new(false);
+            let mut high_run = 0usize;
+            let mut rising_edges = 0usize;
+
+            for step in 0..len {
+                let sample = ((bits >> step) & 1) != 0;
+                high_run = if sample { high_run + 1 } else { 0 };
+                let edge = d.update(sample);
+
+                if high_run < STABLE_COUNT as usize {
+                    assert_ne!(edge, Some(Edge::Rising), "len={len} bits={bits:08b} step={step}");
+                }
+                if edge == Some(Edge::Rising) {
+                    rising_edges += 1;
+                    assert!(high_run >= STABLE_COUNT as usize);
+                }
+            }
+
+            assert!(rising_edges <= 1, "duplicate rising edge: len={len} bits={bits:08b}");
+        }
+    }
+}
+
+#[test]
+fn exhaustive_sequences_do_not_fall_before_stable_count() {
+    let max_len = 8usize;
+    for len in 0..=max_len {
+        for bits in 0usize..(1usize << len) {
+            let mut d = Debouncer::new(true);
+            let mut low_run = 0usize;
+            let mut falling_edges = 0usize;
+
+            for step in 0..len {
+                let sample = ((bits >> step) & 1) != 0;
+                low_run = if sample { 0 } else { low_run + 1 };
+                let edge = d.update(sample);
+
+                if low_run < STABLE_COUNT as usize {
+                    assert_ne!(edge, Some(Edge::Falling), "len={len} bits={bits:08b} step={step}");
+                }
+                if edge == Some(Edge::Falling) {
+                    falling_edges += 1;
+                    assert!(low_run >= STABLE_COUNT as usize);
+                }
+            }
+
+            assert!(falling_edges <= 1, "duplicate falling edge: len={len} bits={bits:08b}");
+        }
+    }
 }
