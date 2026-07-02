@@ -289,6 +289,19 @@ Or use the workspace alias (Apple Silicon):
 cargo test-host
 ```
 
+**Local CI** — full pipeline on this machine (format → build → clippy `-D warnings`
+→ supply-chain analyze → tests → coverage → size budget → docs → optional HIL):
+
+```bash
+ci/local-ci.sh              # all host stages (HIL skipped without a board)
+ci/local-ci.sh --hil        # + flash via probe-rs and RTT boot-marker smoke test
+ci/local-ci.sh --only lint  # a single stage
+```
+
+The `analyze` stage runs `cargo audit` (RustSec advisory DB) and `cargo deny`
+(SPDX license allow-list, banned sources — policy in [`deny.toml`](deny.toml));
+missing optional tools are reported as SKIP with an install hint, never FAIL.
+
 ---
 
 ## Network configuration
