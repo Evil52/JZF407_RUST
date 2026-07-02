@@ -17,7 +17,7 @@ fn single_glitch_suppressed() {
     // One high sample then back to low — must not trigger
     d.update(true);
     assert_eq!(d.update(false), None);
-    assert_eq!(d.state(), false);
+    assert!(!d.state());
 }
 
 #[test]
@@ -29,7 +29,7 @@ fn stable_high_triggers_rising() {
     assert_eq!(d.update(true), None);
     let edge = d.update(true);
     assert_eq!(edge, Some(Edge::Rising));
-    assert_eq!(d.state(), true);
+    assert!(d.state());
 }
 
 #[test]
@@ -40,16 +40,20 @@ fn stable_low_triggers_falling() {
     assert_eq!(d.update(false), None);
     let edge = d.update(false);
     assert_eq!(edge, Some(Edge::Falling));
-    assert_eq!(d.state(), false);
+    assert!(!d.state());
 }
 
 #[test]
 fn rising_then_falling() {
     let mut d = Debouncer::new(false);
-    for _ in 0..4 { d.update(true); }
-    assert_eq!(d.state(), true);
-    for _ in 0..3 { d.update(false); }
-    assert_eq!(d.state(), true); // not yet
+    for _ in 0..4 {
+        d.update(true);
+    }
+    assert!(d.state());
+    for _ in 0..3 {
+        d.update(false);
+    }
+    assert!(d.state()); // not yet
     let e = d.update(false);
     assert_eq!(e, Some(Edge::Falling));
 }
@@ -60,7 +64,9 @@ fn noisy_signal_no_false_edge() {
     let noisy = [true, false, true, false, true, false, true, false];
     let mut edges = 0usize;
     for &s in &noisy {
-        if d.update(s).is_some() { edges += 1; }
+        if d.update(s).is_some() {
+            edges += 1;
+        }
     }
     assert_eq!(edges, 0);
 }
@@ -68,7 +74,9 @@ fn noisy_signal_no_false_edge() {
 #[test]
 fn no_double_edge_on_same_stable_state() {
     let mut d = Debouncer::new(false);
-    for _ in 0..4 { d.update(true); }
+    for _ in 0..4 {
+        d.update(true);
+    }
     // Additional highs should not re-trigger
     assert_eq!(d.update(true), None);
     assert_eq!(d.update(true), None);
@@ -77,34 +85,39 @@ fn no_double_edge_on_same_stable_state() {
 #[test]
 fn initial_state_low() {
     let d = Debouncer::new(false);
-    assert_eq!(d.state(), false);
+    assert!(!d.state());
 }
 
 #[test]
 fn initial_state_high() {
     let d = Debouncer::new(true);
-    assert_eq!(d.state(), true);
+    assert!(d.state());
 }
 
 #[test]
 fn three_highs_not_enough() {
     let mut d = Debouncer::new(false);
-    for _ in 0..3 { assert_eq!(d.update(true), None); }
-    assert_eq!(d.state(), false);
+    for _ in 0..3 {
+        assert_eq!(d.update(true), None);
+    }
+    assert!(!d.state());
 }
 
 #[test]
 fn glitch_between_stable_transitions() {
     let mut d = Debouncer::new(false);
     // Almost stable: 3 highs, 1 low glitch, then stable highs
-    d.update(true); d.update(true); d.update(true);
+    d.update(true);
+    d.update(true);
+    d.update(true);
     d.update(false); // glitch resets count
-    // Now need 4 more consecutive highs
-    for _ in 0..3 { assert_eq!(d.update(true), None); }
+                     // Now need 4 more consecutive highs
+    for _ in 0..3 {
+        assert_eq!(d.update(true), None);
+    }
     let e = d.update(true);
     assert_eq!(e, Some(Edge::Rising));
 }
-
 
 #[test]
 fn exhaustive_sequences_do_not_rise_before_stable_count() {
@@ -121,7 +134,11 @@ fn exhaustive_sequences_do_not_rise_before_stable_count() {
                 let edge = d.update(sample);
 
                 if high_run < STABLE_COUNT as usize {
-                    assert_ne!(edge, Some(Edge::Rising), "len={len} bits={bits:08b} step={step}");
+                    assert_ne!(
+                        edge,
+                        Some(Edge::Rising),
+                        "len={len} bits={bits:08b} step={step}"
+                    );
                 }
                 if edge == Some(Edge::Rising) {
                     rising_edges += 1;
@@ -129,7 +146,10 @@ fn exhaustive_sequences_do_not_rise_before_stable_count() {
                 }
             }
 
-            assert!(rising_edges <= 1, "duplicate rising edge: len={len} bits={bits:08b}");
+            assert!(
+                rising_edges <= 1,
+                "duplicate rising edge: len={len} bits={bits:08b}"
+            );
         }
     }
 }
@@ -149,7 +169,11 @@ fn exhaustive_sequences_do_not_fall_before_stable_count() {
                 let edge = d.update(sample);
 
                 if low_run < STABLE_COUNT as usize {
-                    assert_ne!(edge, Some(Edge::Falling), "len={len} bits={bits:08b} step={step}");
+                    assert_ne!(
+                        edge,
+                        Some(Edge::Falling),
+                        "len={len} bits={bits:08b} step={step}"
+                    );
                 }
                 if edge == Some(Edge::Falling) {
                     falling_edges += 1;
@@ -157,7 +181,10 @@ fn exhaustive_sequences_do_not_fall_before_stable_count() {
                 }
             }
 
-            assert!(falling_edges <= 1, "duplicate falling edge: len={len} bits={bits:08b}");
+            assert!(
+                falling_edges <= 1,
+                "duplicate falling edge: len={len} bits={bits:08b}"
+            );
         }
     }
 }

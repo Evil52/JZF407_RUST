@@ -1,16 +1,11 @@
-//! Firmware-side config: EEPROM load on top of the pure-logic NetworkConfig.
-
 use crate::eeprom;
 pub use jzf407_logic::config::NetworkConfig;
-// Single source of truth for the serialised image size (now 175 B with the
-// MQTT + web credential fields appended) — see logic::config layout doc.
 use jzf407_logic::config::LEN;
 
 const BASE: u8 = 16;
 
-/// Read NetworkConfig from AT24C02 starting at byte 16.
-/// Returns defaults if the magic is wrong or on any I2C error, so a blank or
-/// unreachable EEPROM always boots the device on its built-in defaults.
+/// Falls back to defaults on wrong magic or any I2C error, so a blank or
+/// unreachable EEPROM always boots.
 pub fn load_config() -> NetworkConfig {
     let mut buf = [0u8; LEN];
     let read_ok = crate::eeprom::EEPROM
@@ -24,7 +19,6 @@ pub fn load_config() -> NetworkConfig {
     NetworkConfig::from_bytes(&buf).unwrap_or_default()
 }
 
-/// Write NetworkConfig to AT24C02 at byte 16.
 pub async fn save_config(cfg: &NetworkConfig) -> Result<(), embassy_stm32::i2c::Error> {
     let mut guard = eeprom::EEPROM.lock().await;
     let ee = guard.as_mut().ok_or(embassy_stm32::i2c::Error::Overrun)?;

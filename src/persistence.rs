@@ -1,18 +1,15 @@
-//! Persist LED state to AT24C02.
-//!
-//! The relay is deliberately NOT persisted: it is a momentary 2 s pulse output
-//! (see `outputs::relay_task`), so it always idles OFF — there is no steady
-//! state to restore. Byte [4] is kept reserved so the layout stays stable.
+//! Persist LED state to AT24C02 at offset 0 (network config lives at 16).
+//! The relay is a momentary 2 s pulse and is deliberately NOT persisted;
+//! byte 4 stays reserved so the layout is stable.
 //!
 //! Layout (bytes 0..7):
-//!   [0..3]  magic 0xCA, 0xFE, 0xF0, 0x0D
-//!   [4]     (reserved, was relay)
-//!   [5]     led1:   bit0
-//!   [6]     led2:   bit0
-//!   [7]     (reserved)
-//!
-//! RAM-cache: only flush to EEPROM when state actually changes.
-//! Uses the global `crate::eeprom::EEPROM` mutex.
+//! ```text
+//!   [0..3]  magic 0xCA 0xFE 0xF0 0x0D
+//!   [4]     reserved (was relay)
+//!   [5]     led1: bit0
+//!   [6]     led2: bit0
+//!   [7]     reserved
+//! ```
 
 use crate::eeprom;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -27,11 +24,8 @@ pub struct OutputState {
     pub led2: bool,
 }
 
-/// RAM-cache guarded by a mutex — shared between buttons_task (saves on change)
-/// and mqtt_task (saves on MQTT command).
 pub static STATE_CACHE: Mutex<CriticalSectionRawMutex, Option<OutputState>> = Mutex::new(None);
 
-/// Load state from EEPROM (blocking read, once at boot). Returns default if magic is wrong.
 pub fn load_state() -> OutputState {
     let mut buf = [0u8; 8];
     let read_ok = eeprom::EEPROM
@@ -48,7 +42,6 @@ pub fn load_state() -> OutputState {
         OutputState::default()
     };
 
-    // Seed the RAM-cache
     cortex_m::interrupt::free(|_| {
         *STATE_CACHE.try_lock().unwrap() = Some(state);
     });
@@ -72,9 +65,9 @@ pub async fn save_leds(led1: bool, led2: bool) {
     .await;
 }
 
-/// Apply a field update to the cached state and flush to EEPROM only if it
-/// actually changed. Each caller knows just its own LED; the cache holds the
-/// full state so a partial update never clobbers siblings.
+// Cache is updated only after a successful EEPROM write: a failed write leaves
+// the old cached value, so the next call with the same state retries instead of
+// short-circuiting on an already-"new" cache.
 async fn save_field(update: impl FnOnce(&mut OutputState)) {
     let mut cache = STATE_CACHE.lock().await;
     let mut state = (*cache).unwrap_or_default();
@@ -82,15 +75,13 @@ async fn save_field(update: impl FnOnce(&mut OutputState)) {
     if *cache == Some(state) {
         return;
     }
-    *cache = Some(state);
-    drop(cache);
 
     let buf: [u8; 8] = [
         MAGIC[0],
         MAGIC[1],
         MAGIC[2],
         MAGIC[3],
-        0, // [4] reserved (was relay)
+        0,
         state.led1 as u8,
         state.led2 as u8,
         0,
@@ -98,6 +89,8 @@ async fn save_field(update: impl FnOnce(&mut OutputState)) {
 
     let mut guard = eeprom::EEPROM.lock().await;
     if let Some(ref mut ee) = *guard {
-        let _ = ee.write_bytes(BASE, &buf).await;
+        if ee.write_bytes(BASE, &buf).await.is_ok() {
+            *cache = Some(state);
+        }
     }
 }

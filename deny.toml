@@ -1,0 +1,39 @@
+# Политика supply-chain для `cargo deny check` (стадия analyze в ci/local-ci.sh).
+# Справка: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Проверяем оба таргета проекта: прошивку и host-тесты logic-крейта.
+targets = [
+    "thumbv7em-none-eabihf",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+]
+
+[advisories]
+# RustSec advisory database: уязвимость в дереве зависимостей = ошибка.
+yanked = "deny"
+
+[licenses]
+# Разрешены только permissive-лицензии, совместимые с проприетарной прошивкой.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Дубликаты версий — предупреждение (в embedded-дереве почти неизбежны).
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# Зависимости только из crates.io — никаких git/незнакомых реестров.
+unknown-registry = "deny"
+unknown-git = "deny"

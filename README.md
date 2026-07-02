@@ -22,9 +22,10 @@ built-in HTTP configuration page.
 - **Storage:** AT24C02 I²C EEPROM (network config + output state)
 
 > Status: **MVP working on hardware.** Ethernet, MQTT, HTTP UI, EEPROM
-> persistence, buttons, watchdog and reset-reason reporting all function with
+> persistence, watchdog and reset-reason reporting all function with
 > **no debugger attached** — see [Hardware bring-up notes](#hardware-bring-up-notes)
-> for the non-obvious fixes that made that possible.
+> for the non-obvious fixes that made that possible. The buttons task is
+> currently **disabled** (S1/S2 are not wired to any action).
 
 ---
 
@@ -77,7 +78,7 @@ safe. The entire firmware fits in **~163 KB of the 512 KB flash** and uses
 CubeMX generates thousands of lines of C that must be carefully preserved across
 regeneration cycles. Embassy's Rust drivers are written in the same language as
 the application, composable, and don't require a GUI code-generator. The `logic/`
-crate runs its 50 unit tests on the host in milliseconds — no hardware, no
+crate runs its unit tests on the host in milliseconds — no hardware, no
 emulator — because Rust's `no_std` / native dual-target model makes that trivial.
 Refactoring is safe: the compiler finds every broken call site.
 
@@ -125,8 +126,8 @@ confidence that it cannot silently break existing functionality.
 | PE13 | LED1 | **active-LOW** (drive low = on) |
 | PE14 | LED2 | **active-LOW** |
 | PE15 | LED3 — heartbeat | **active-LOW**, ~5 Hz proof-of-life blink |
-| PE10 | Button S1 → relay ON | HW pull-up (R17); idle = High, pressed = Low |
-| PE11 | Button S2 → relay OFF | HW pull-up (R18); idle = High, pressed = Low |
+| PE10 | Button S1 | HW pull-up (R17); **buttons task disabled — no action** |
+| PE11 | Button S2 | HW pull-up (R18); **buttons task disabled — no action** |
 | PD4 | Relay (SONGLE) | **active-HIGH** (drive high = energized); off at boot |
 | PB8 | I2C1_SCL → AT24C02 | external 4.7 kΩ pull-up |
 | PB9 | I2C1_SDA → AT24C02 | external 4.7 kΩ pull-up |
@@ -151,13 +152,14 @@ confidence that it cannot silently break existing functionality.
 
 ## Task architecture
 
-Eight Embassy tasks are spawned from `main()`; none of them block the executor.
+Seven Embassy tasks are spawned from `main()`; none of them block the executor.
+(`buttons_task` exists in the source but is **not spawned** — see
+[`src/buttons.rs`](src/buttons.rs).)
 
 ```
 main()  — clock/peripheral init, EEPROM recovery, config load, then spawns:
  ├── heartbeat_led_task   LED3 ~5 Hz blink, no dependencies (executor liveness)
  ├── watchdog_task        IWDG ~20 s timeout, petted every 1.5 s
- ├── buttons_task         S1/S2 polled every 10 ms, 40 ms debounce → relay
  ├── net_task             embassy-net runner (drives the Ethernet MAC/DMA)
  ├── mqtt_task            MQTT client + reconnect loop + 10 s heartbeat publish
  ├── relay_task           monostable relay pulse driver (2 s on-time)
@@ -179,30 +181,35 @@ solves it. Sockets are allocated from `StackResources<8>`.
 | Object | Type | Purpose |
 |--------|------|---------|
 | `OUTPUTS` | `SharedOutputs` = `Mutex<Option<OutputPins>>` | single owner of LED1/LED2/relay pins; all tasks drive them through it |
-| `RELAY_CHANGE` | `Signal<bool>` | buttons_task / web_task → mqtt_task: "relay changed, publish it" |
+| `RELAY_CHANGE` | `Signal<bool>` | relay_task → mqtt_task: "relay changed, publish it" |
 | `MQTT_ONLINE` | `AtomicBool` | mqtt_task → web_task/web_task_b: true while broker connection is live |
 | `EEPROM` | `Mutex<Option<Eeprom>>` | global AT24C02 handle shared by config + persistence |
 
 **Relay control flow (and why there is no echo loop)**
 
+The relay is a **momentary 2 s pulse output**, not a latched state. Any truthy
+command on `stm32/relay` fires `pulse_relay()`; `relay_task` owns the timing,
+holds the pin HIGH for 2 s (retrigger restarts the window), then drops it and
+signals `RELAY_CHANGE(false)` so MQTT publishes the actual OFF state. The relay
+is **not persisted** — it always boots OFF.
+
 ```
-Button S1/S2 ─┐
-Web /relay/on ─┼─► OUTPUTS.set_relay() ─► pin ─► persistence.save_relay()
-              │                            │
-              └─► RELAY_CHANGE.signal() ───┘
-                            │
-                            ▼
-                  mqtt_task publishes stm32/relay
+MQTT stm32/relay ─► pulse_relay() ─► relay_task ─► pin HIGH 2 s ─► pin LOW
+                                                                     │
+                                              RELAY_CHANGE ◄─────────┘
+                                                    │
+                                                    ▼
+                                        mqtt_task publishes stm32/relay
 ```
 
-An inbound `stm32/relay` MQTT message drives the pin **directly** and does
-**not** raise `RELAY_CHANGE` — otherwise we would publish to `stm32/relay`, the
-broker would echo it back (we subscribe to it), and the device would loop
-forever. See `handle_event` in [`src/mqtt.rs`](src/mqtt.rs).
+An inbound `stm32/relay` MQTT message does **not** raise `RELAY_CHANGE` on the
+receive path — otherwise we would publish to `stm32/relay`, the broker would
+echo it back (we subscribe to it), and the device would loop forever. See
+`handle_event` in [`src/mqtt.rs`](src/mqtt.rs).
 
 **Single source of truth for relay display:** the web page reads the live pin
-via `OUTPUTS.get_relay()` (not the cache), so a relay toggled by button and then
-by MQTT always shows the correct state.
+via `OUTPUTS.get_relay()` (not a cache), so the dashboard always shows the
+actual pin state, including mid-pulse.
 
 ---
 
@@ -321,35 +328,39 @@ unavailable. Because smoltcp distributes connections arbitrarily, both
 `web_task` and `web_task_b` serve `/events` as well as normal requests (see
 two-socket pool above).
 
-**Session auth.** A session cookie (`sid`) is issued on login and checked on
-every request including `/events`. The SSE stream does **not** refresh the
-session TTL (to prevent an open stream from keeping a session alive
-indefinitely). POST actions that change state require an active session;
-`/state` and `/events` reads do not refresh TTL but still require auth if
-credentials are configured.
+**Session auth (form login).** Set a *Web Login* username/password on the
+config page. `POST /login` checks the submitted credentials (compared as a
+`base64(user:pass)` token built once at boot — see
+[`logic/src/auth.rs`](logic/src/auth.rs), unit-tested on the host) and mints a
+session cookie (`jzf_session`, HttpOnly, SameSite=Strict) that every later
+request is authenticated by. There is **no HTTP Basic Auth** — browsers cache
+Basic credentials, which makes logout impossible. Leaving both fields blank
+disables auth entirely (default after first flash).
 
-**HTTP Basic Auth (web login).** Set a *Web Login* username/password on the
-config page. The firmware builds the expected `base64(user:pass)` once at boot
-and compares — it never decodes the header at runtime (see
-[`logic/src/auth.rs`](logic/src/auth.rs), unit-tested on the host). Leaving
-both fields blank disables auth entirely (default after first flash).
+The session has a 15-min idle TTL. Real navigation slides the TTL; the
+background `/state` poll and the `/events` stream refresh it only while the
+page reports recent user activity, so an abandoned tab cannot keep the session
+alive. Five consecutive failed logins lock the form for 60 s. Saved passwords
+are **never rendered back** into the page — an empty password field on `/save`
+means "keep the current value".
 
-> ⚠️ Credentials travel base64-encoded over plain `http://`, **not encrypted**.
-> Sufficient for a trusted LAN; not a substitute for TLS on the public internet.
-> Restrict the forwarded port by source IP when exposing externally.
+> ⚠️ Credentials travel over plain `http://`, **not encrypted**. Sufficient for
+> a trusted LAN; not a substitute for TLS on the public internet. Restrict the
+> forwarded port by source IP when exposing externally.
 
 | Method | Path | Action |
 |--------|------|--------|
-| `GET` | `/` | Dashboard (status + relay control + config form) |
+| `GET` | `/` | Dashboard (status + config form) |
 | `GET` | `/state` | JSON snapshot of current state (used by JS fallback) |
 | `GET` | `/events` | SSE stream — push on diff, keepalive every 15 s |
-| `POST` | `/relay/on` | Energize relay, persist, publish `stm32/relay` → redirect `/` |
-| `POST` | `/relay/off` | De-energize relay, persist, publish `stm32/relay` → redirect `/` |
-| `POST` | `/save` | Validate + write config to EEPROM, then reboot |
+| `GET` | `/login` | Redirect to `/` when authenticated (form is served on 401) |
+| `POST` | `/login` | Validate credentials → set session cookie → redirect `/` |
+| `POST` | `/save` | Validate + write config to EEPROM, then reboot; EEPROM error → `500`, no reboot |
 | `POST` | `/reboot` | Reboot with no config change |
 | `POST` | `/logout` | Invalidate session cookie → redirect to login |
 
-Both `/save` and `/reboot` use `safe_reboot()` (see below). Invalid form input
+There are no `/relay/*` endpoints — the relay is driven over MQTT only. Both
+`/save` and `/reboot` use `safe_reboot()` (see below). Invalid form input
 returns `400` and does **not** write or reboot.
 
 ---
@@ -357,8 +368,11 @@ returns `400` and does **not** write or reboot.
 ## MQTT interface
 
 The client connects to the configured broker, sets an LWT, then subscribes to
-the control topics. A 3 s grace period after connect drops retained messages so
-a stale retained command can't fire on every reconnect.
+the control topics. Incoming publishes with the **retained flag** set are
+ignored: a retained message is a stale broker-stored command that would
+otherwise re-fire on every reconnect. Live commands (retain=false) are always
+processed, including immediately after a reconnect — do not publish control
+commands with `-r`/retain.
 
 **Authentication.** If an MQTT username is configured (web page → *MQTT Auth*,
 persisted in EEPROM), it is sent in the CONNECT packet along with the password;
@@ -378,7 +392,7 @@ unauthenticated client cannot publish to `stm32/#`.
 | `stm32/led/1` | `1`/`0` | Sub | LED1 on/off |
 | `stm32/led/2` | `1`/`0` | Sub | LED2 on/off |
 | `stm32/led/all` | `1`/`0` | Sub | Both LEDs |
-| `stm32/relay` | `1`/`0` | Sub | Relay on/off |
+| `stm32/relay` | `1`/`0` | Sub | `1` fires a 2 s pulse (retrigger restarts), `0` cancels |
 | `stm32/ping` | any | Sub | Echo → `stm32/pong` (RTT probe) |
 | `stm32/cmd/reboot` | any | Sub | Remote reboot (`safe_reboot`) |
 | `stm32/status` | `online`/`offline` | Pub (retained) | LWT — `offline` on disconnect |
@@ -417,7 +431,7 @@ EEPROM is only written when a value actually changes (saves write cycles).
 
 ```
 [0..4)  magic
-[4]     relay (bit0)
+[4]     reserved (was relay — the relay is a momentary pulse, not persisted)
 [5]     led1  (bit0)
 [6]     led2  (bit0)
 [7]     reserved
@@ -440,9 +454,11 @@ EEPROM is only written when a value actually changes (saves write cycles).
 [159..191)  web password  (NUL-terminated, ≤32 bytes)
 ```
 
-Validation is **magic-only** (no CRC). A wrong magic → defaults. A torn write
-could in theory pass the magic check, so config is treated as advisory: anything
-that fails to parse reverts to defaults rather than being trusted.
+There is **no CRC**, but parsing validates the critical fields: wrong magic,
+`prefix_len` outside `1..=32` (would panic in `Ipv4Cidr::new` at boot and
+brick the board into a reset loop), or a zero broker port all reject the image
+and the firmware boots on defaults. A torn write can still yield a plausible
+struct, so config is treated as advisory, never trusted blindly.
 
 The four credential fields were appended after the original 49-byte layout. A
 device flashed before this change has blank (`0xFF`) bytes in `[63..191)`; those
@@ -511,13 +527,14 @@ makes them so confusing to debug. Keep them.
 | Situation | Behavior |
 |-----------|----------|
 | Cable unplugged / broker restart | MQTT reconnects automatically (1 s backoff) |
-| Power restored after outage | Boots, restores last output state, reconnects |
-| Button pressed with no MQTT | S1/S2 still drive the relay locally |
-| Retained messages on reconnect | Ignored for the first 3 s (grace period) |
+| Power restored after outage | Boots, restores last LED state, reconnects; relay boots OFF |
+| Retained messages | Ignored (retain flag filtered in `handle_event`) |
+| EEPROM write fails on `/save` | `500` response, config not saved, **no reboot** |
 | Firmware wedged (panic/deadlock) | IWDG resets after ~20 s → `stm32/diag = iwdg_timeout` |
 
-Outputs are **fail-last**: relay and LED state are persisted to EEPROM and
-restored on boot, so a power cycle resumes the last commanded state.
+LEDs are **fail-last**: their state is persisted to EEPROM and restored on
+boot. The relay is a momentary 2 s pulse output and is **not** persisted — it
+always boots OFF.
 
 ---
 
@@ -561,8 +578,8 @@ JZF407VET6/
 ├── .cargo/config.toml      target = thumbv7em-none-eabihf, runner = probe-rs run
 ├── src/                    firmware (no_std, target-only)
 │   ├── main.rs             clock/peripheral init, bring-up fixes, task spawning
-│   ├── outputs.rs          SharedOutputs mutex over LED1/LED2/relay (polarity lives here)
-│   ├── buttons.rs          S1/S2 polling + debounce → relay
+│   ├── outputs.rs          SharedOutputs mutex over LED1/LED2/relay + relay pulse task
+│   ├── buttons.rs          DISABLED — commented-out template, not spawned
 │   ├── mqtt.rs             MQTT client, topic handling, reconnect, grace period
 │   ├── web.rs              HTTP server (raw TcpSocket), two-socket pool, router
 │   ├── sse.rs              SSE stream body — push on diff every 150 ms + keepalive
@@ -577,9 +594,10 @@ JZF407VET6/
     ├── src/
     │   ├── debouncer.rs    sample-history debounce state machine
     │   ├── led_dispatch.rs MQTT topic+payload → OutputCmd
-    │   ├── auth.rs         HTTP Basic Auth token builder (base64 of user:pass)
+    │   ├── auth.rs         login token builder (base64 of user:pass)
+    │   ├── web_form.rs     form url-decode, HTML attr escaping, secret keep-on-empty
     │   └── config.rs       NetworkConfig (de)serialization + parse_ipv4/parse_port
-    └── tests/              59 native unit tests
+    └── tests/              native unit tests (run ./test.sh)
 ```
 
 The `logic` crate deliberately has **no Embassy or hardware dependencies** so

@@ -1,7 +1,5 @@
 use heapless::String as HString;
-use jzf407_logic::web_form::{
-    form_url_decode, html_escape_attr, secret_from_form, FormError,
-};
+use jzf407_logic::web_form::{form_url_decode, html_escape_attr, secret_from_form, FormError};
 
 #[test]
 fn form_url_decode_handles_plus_percent_and_utf8() {
@@ -11,13 +9,22 @@ fn form_url_decode_handles_plus_percent_and_utf8() {
 
 #[test]
 fn form_url_decode_rejects_invalid_percent_escape() {
-    assert_eq!(form_url_decode::<16>("abc%zz"), Err(FormError::InvalidEncoding));
-    assert_eq!(form_url_decode::<16>("abc%"), Err(FormError::InvalidEncoding));
+    assert_eq!(
+        form_url_decode::<16>("abc%zz"),
+        Err(FormError::InvalidEncoding)
+    );
+    assert_eq!(
+        form_url_decode::<16>("abc%"),
+        Err(FormError::InvalidEncoding)
+    );
 }
 
 #[test]
 fn form_url_decode_rejects_invalid_utf8_after_percent_decode() {
-    assert_eq!(form_url_decode::<16>("bad%D0"), Err(FormError::InvalidEncoding));
+    assert_eq!(
+        form_url_decode::<16>("bad%D0"),
+        Err(FormError::InvalidEncoding)
+    );
 }
 
 #[test]
@@ -54,5 +61,8 @@ fn non_empty_secret_form_field_replaces_existing_secret() {
 fn oversized_secret_form_field_is_rejected() {
     let current = HString::<32>::try_from("old-secret").unwrap();
     let too_long = "x".repeat(33);
-    assert_eq!(secret_from_form(&current, &too_long), Err(FormError::Capacity));
+    assert_eq!(
+        secret_from_form(&current, &too_long),
+        Err(FormError::Capacity)
+    );
 }

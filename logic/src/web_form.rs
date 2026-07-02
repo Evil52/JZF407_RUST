@@ -1,9 +1,5 @@
-//! Pure helpers for HTTP form handling and HTML attribute safety.
-//!
-//! The firmware HTTP server is target-only, but these helpers are ordinary
-//! no_std logic so malformed form bodies and escaping rules can be tested on the
-//! host. They intentionally fail closed: bad percent encoding or capacity
-//! overflow returns an error instead of silently truncating credentials/config.
+//! Form url-decode / HTML-escape helpers. Fail closed: bad percent encoding or
+//! capacity overflow errors out instead of silently truncating credentials.
 
 use heapless::{String, Vec};
 
@@ -30,7 +26,9 @@ pub fn form_url_decode<const N: usize>(s: &str) -> Result<String<N>, FormError> 
                 }
                 let h = hex_digit(bytes[i + 1]).ok_or(FormError::InvalidEncoding)?;
                 let l = hex_digit(bytes[i + 2]).ok_or(FormError::InvalidEncoding)?;
-                bytes_out.push((h << 4) | l).map_err(|_| FormError::Capacity)?;
+                bytes_out
+                    .push((h << 4) | l)
+                    .map_err(|_| FormError::Capacity)?;
                 i += 3;
             }
             byte => {
@@ -40,7 +38,8 @@ pub fn form_url_decode<const N: usize>(s: &str) -> Result<String<N>, FormError> 
         }
     }
 
-    let decoded = core::str::from_utf8(bytes_out.as_slice()).map_err(|_| FormError::InvalidEncoding)?;
+    let decoded =
+        core::str::from_utf8(bytes_out.as_slice()).map_err(|_| FormError::InvalidEncoding)?;
     String::try_from(decoded).map_err(|_| FormError::Capacity)
 }
 
@@ -59,6 +58,8 @@ pub fn html_escape_attr<const N: usize>(s: &str) -> Result<String<N>, FormError>
     Ok(out)
 }
 
+/// Empty submitted value means "keep the stored secret" — passwords are never
+/// rendered back into the page, so an untouched field must not wipe them.
 pub fn secret_from_form<const N: usize>(
     current: &String<N>,
     submitted: &str,

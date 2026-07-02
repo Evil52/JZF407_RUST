@@ -10,21 +10,18 @@ use jzf407_logic::web_form::{form_url_decode, html_escape_attr, secret_from_form
 
 const HTTP_OK: &str =
     "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n";
-// JSON response for /state polling. `no-store` stops the browser caching it, so
-// each poll reflects the live pin state.
 const HTTP_OK_JSON: &str =
     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
-// Cookie clearing uses Max-Age=0 + a past Expires for max browser compatibility.
-// Path=/ must match the path the cookie was set with, or the browser keeps it.
-// Redirect to the dashboard (used when an authenticated client hits /login).
 const HTTP_303_HOME: &str = "HTTP/1.1 303 See Other\r\nLocation: /\r\nConnection: close\r\n\r\n";
 
-// Logout: clear the cookie and redirect to the login form.
+// Cookie clearing needs Max-Age=0 + past Expires and the same Path=/ it was set
+// with, or the browser keeps it.
 const HTTP_303_LOGOUT: &str = "HTTP/1.1 303 See Other\r\n\
 Set-Cookie: jzf_session=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Strict\r\n\
 Location: /login\r\nConnection: close\r\n\r\n";
 const HTTP_400: &str = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nBad Request";
 const HTTP_404: &str = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\nNot Found";
+const HTTP_500: &str = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n<html><body><p>EEPROM write failed \u{2014} config NOT saved. <a href=/>back</a></p></body></html>";
 
 const LOGIN_HEAD: &str = "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>\
 <meta name='viewport' content='width=device-width,initial-scale=1'><title>JZF407 // AUTH</title>\
@@ -66,16 +63,17 @@ button::after{bottom:-1px;right:-1px;border-left:none;border-top:none}\
 <p class='sub'>// authorization required</p>";
 
 const LOGIN_ERROR: &str = "<div class='err'>\u{2715} Invalid username or password</div>";
-const LOGIN_LOCKED: &str = "<div class='err'>\u{26a0} Too many failed attempts \u{2014} locked for 60s</div>";
+const LOGIN_LOCKED: &str =
+    "<div class='err'>\u{26a0} Too many failed attempts \u{2014} locked for 60s</div>";
 
-/// Login form (after the optional error message).
 const LOGIN_TAIL: &str = "<form method='post' action='/login'>\
 <label>Username</label><input type='text' name='user' placeholder='user' autocomplete='username' required>\
 <label>Password</label><input type='password' name='pass' placeholder='\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}' autocomplete='current-password' required>\
 <button type='submit'>\u{25b8} Authenticate</button>\
 </form></div></div></body></html>";
 
-// No WWW-Authenticate header: forces browser to render our form, not the native Basic Auth popup.
+// No WWW-Authenticate header anywhere: it would pop the browser's native Basic
+// Auth dialog instead of our form, and cached Basic credentials make logout impossible.
 const HTTP_401_LOGIN: &str = "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n";
 
 const HTTP_401_EXPIRE_COOKIE: &str = "HTTP/1.1 401 Unauthorized\r\n\
@@ -181,15 +179,9 @@ input:focus{outline:0;border-color:var(--cy);background:rgba(0,231,255,.04);box-
 </style></head><body>\
 <div class='gridlines'></div><div class='scanlines'></div><div class='grain'></div><div class='vignette'></div>";
 
-// Footer script. Three concerns:
-// - Live updates: SSE (EventSource /events) pushes relay/led/link/mqtt the
-//   instant they change. A /state poll runs only as a FALLBACK while SSE is
-//   disconnected (old browser, proxy that buffers event-streams, dropped link),
-//   so a healthy page makes ~0 polling traffic.
-// - Live clock/uptime: ticked locally every second from the browser's Date()
-//   and a base uptime re-synced on each SSE/poll payload (the MCU has no RTC).
-// - Auto-logout: 15-min inactivity → POST /logout (server session is the real
-//   gate; this is the convenience timer with a 60 s toast warning).
+// Footer script: SSE live updates with /state polling only as fallback,
+// locally-ticked clock/uptime (no RTC), 15-min idle auto-logout (server session
+// is the real gate).
 const PAGE_FOOT: &str = "<script>\
 function g(i){return document.getElementById(i)}\
 function pl(i,o,t){var e=g(i);if(e){e.className='pill '+(o?'on':'off');e.innerHTML=\"<span class='dot'></span>\"+t}}\
@@ -233,8 +225,6 @@ async fn write_attr(socket: &mut TcpSocket<'_>, s: &str) {
     }
 }
 
-/// Stream one status pill: `<span class='pill on|off' id=...><dot>TEXT</span>`.
-/// `id` lets the client-side poller find and repaint it (see PAGE_FOOT script).
 async fn pill(socket: &mut TcpSocket<'_>, id: &str, on: bool, text: &str) {
     w(socket, "<span class='pill ").await;
     w(socket, if on { "on" } else { "off" }).await;
@@ -245,11 +235,7 @@ async fn pill(socket: &mut TcpSocket<'_>, id: &str, on: bool, text: &str) {
     w(socket, "</span>").await;
 }
 
-/// Live state as compact JSON for the polling script, e.g.
-/// `{"relay":1,"led1":0,"led2":0,"link":1,"mqtt":1,"up":3661,"ip":"192.168.137.2","rst":"power_on"}`.
-/// Outputs are read from the physical pins (single source of truth); `up` is
-/// seconds since boot (formatted client-side). Intentionally logs nothing — it is
-/// hit ~once per second per open page, so logging here would spam the RTT.
+// Hit ~once per second per open page — intentionally logs nothing.
 async fn send_state(
     socket: &mut TcpSocket<'_>,
     cfg: &NetworkConfig,
@@ -276,8 +262,7 @@ async fn send_state(
     let _ = socket.flush().await;
 }
 
-/// Stream the dashboard page to the socket in chunks (avoids a multi-KB buffer in RAM).
-/// Pill/text ids (rp/l1/l2/lk/mq/ip/up) are the hooks the SSE/poll script repaints live.
+// Streamed in chunks to avoid a multi-KB page buffer in RAM.
 async fn send_page(
     socket: &mut TcpSocket<'_>,
     cfg: &NetworkConfig,
@@ -301,7 +286,15 @@ async fn send_page(
     w(socket, "<div class='topbar'><div class='left'><span class='brand'>JZF407 // SIGNAL.EDGE</span><span>SEC \u{25b8} STM32F407VET6</span></div>\
 <div class='brand' style='font-size:10px;letter-spacing:.4em'>\u{2014} REV 2.2 \u{2014}</div>\
 <div class='right'><span>UPLINK ").await;
-    w(socket, if link_up { "<span class='ok'>\u{25cf}</span> NOMINAL" } else { "<span class='hot'>\u{25cf}</span> DOWN" }).await;
+    w(
+        socket,
+        if link_up {
+            "<span class='ok'>\u{25cf}</span> NOMINAL"
+        } else {
+            "<span class='hot'>\u{25cf}</span> DOWN"
+        },
+    )
+    .await;
     w(socket, "</span><span>BUS <span class='hot'>\u{25cf}</span> 168MHZ</span><span id='clk'>--:--:--</span></div></div>").await;
 
     w(socket, "<main><span class='eyebrow'>Arm\u{00ae} Cortex\u{00ae}-M4F // Embassy async firmware</span>\
@@ -336,9 +329,23 @@ async fn send_page(
 <div class='wbody'>\
 <div class='kv'><span class='k'>Ethernet</span>").await;
     pill(socket, "lk", link_up, if link_up { "Up" } else { "Down" }).await;
-    w(socket, "</div><div class='kv'><span class='k'>MQTT Broker</span>").await;
-    pill(socket, "mq", mqtt_up, if mqtt_up { "Online" } else { "Offline" }).await;
-    w(socket, "</div><div class='kv'><span class='k'>IP Address</span><span class='v' id='ip'>").await;
+    w(
+        socket,
+        "</div><div class='kv'><span class='k'>MQTT Broker</span>",
+    )
+    .await;
+    pill(
+        socket,
+        "mq",
+        mqtt_up,
+        if mqtt_up { "Online" } else { "Offline" },
+    )
+    .await;
+    w(
+        socket,
+        "</div><div class='kv'><span class='k'>IP Address</span><span class='v' id='ip'>",
+    )
+    .await;
     w(socket, ip.as_str()).await;
     w(socket, "</span></div></div></div></div>").await;
 
@@ -348,26 +355,58 @@ async fn send_page(
 <div class='wbody'><form method='post' action='/save'>\
 <div class='sec first'>Network</div><label>IP address</label><input type='text' name='ip' value='").await;
     w(socket, ip.as_str()).await;
-    w(socket, "'><div class='row'><div><label>Prefix</label><input type='number' name='prefix' value='").await;
+    w(
+        socket,
+        "'><div class='row'><div><label>Prefix</label><input type='number' name='prefix' value='",
+    )
+    .await;
     w(socket, prefix.as_str()).await;
-    w(socket, "'></div><div><label>Gateway</label><input type='text' name='gw' value='").await;
+    w(
+        socket,
+        "'></div><div><label>Gateway</label><input type='text' name='gw' value='",
+    )
+    .await;
     w(socket, gw.as_str()).await;
     w(socket, "'></div></div><div class='sec'>MQTT Broker</div><div class='row'><div><label>Broker IP</label><input type='text' name='broker' value='").await;
     w(socket, bk.as_str()).await;
-    w(socket, "'></div><div><label>Port</label><input type='number' name='port' value='").await;
+    w(
+        socket,
+        "'></div><div><label>Port</label><input type='number' name='port' value='",
+    )
+    .await;
     w(socket, port.as_str()).await;
-    w(socket, "'></div></div><label>Client ID</label><input type='text' name='id' value='").await;
+    w(
+        socket,
+        "'></div></div><label>Client ID</label><input type='text' name='id' value='",
+    )
+    .await;
     write_attr(socket, cfg.client_id.as_str()).await;
 
     w(socket, "'><div class='sec'>MQTT Auth</div><div class='row'><div><label>Username</label><input type='text' name='muser' value='").await;
     write_attr(socket, cfg.mqtt_user.as_str()).await;
     w(socket, "'></div><div><label>Password</label><input type='password' name='mpass' value='' placeholder='").await;
-    w(socket, if cfg.mqtt_pass.is_empty() { "" } else { "leave blank to keep" }).await;
+    w(
+        socket,
+        if cfg.mqtt_pass.is_empty() {
+            ""
+        } else {
+            "leave blank to keep"
+        },
+    )
+    .await;
 
     w(socket, "'></div></div><div class='sec'>Web Login</div><div class='row'><div><label>Username</label><input type='text' name='wuser' value='").await;
     write_attr(socket, cfg.web_user.as_str()).await;
     w(socket, "'></div><div><label>Password</label><input type='password' name='wpass' value='' placeholder='").await;
-    w(socket, if cfg.web_pass.is_empty() { "" } else { "leave blank to keep" }).await;
+    w(
+        socket,
+        if cfg.web_pass.is_empty() {
+            ""
+        } else {
+            "leave blank to keep"
+        },
+    )
+    .await;
 
     w(socket, "'></div></div><button class='btn save'>\u{25b8} Save &amp; Reboot</button></form></div>\
 <div class='foot'><form method='post' action='/reboot' style='flex:1'><button class='btn reboot'>Reboot</button></form>\
@@ -412,45 +451,28 @@ fn push_u16_dec<const N: usize>(buf: &mut HString<N>, v: u16) {
     let _ = write!(buf, "{}", v);
 }
 
-/// Global session state: a 64-bit token (two 32-bit atomics: top/bottom halves)
-/// plus the uptime-seconds it was last refreshed. POST /login validates the
-/// submitted credentials, mints this token, and sets it as the `jzf_session`
-/// cookie. Every later request is authenticated by that cookie alone — there is
-/// no HTTP Basic Auth (browsers cache and auto-resend Basic credentials, which
-/// makes logout impossible). Logout clears the token here and expires the cookie.
-/// A single global session means one logged-in client at a time (fine for this
-/// device); a new login supersedes the previous one.
+// Single global session (one logged-in client; a new login supersedes the old):
+// a 64-bit token split across two atomics + the uptime-second it was refreshed.
 static SESSION_TOKEN_HI: AtomicU32 = AtomicU32::new(0);
 static SESSION_TOKEN_LO: AtomicU32 = AtomicU32::new(0);
 static SESSION_CREATED: AtomicU32 = AtomicU32::new(0);
 
-/// Brute-force protection: count of consecutive failed login attempts and the
-/// uptime-second of the last failure. After LOGIN_MAX_FAILS consecutive failures
-/// the login form returns 429 and shows a lockout message for LOGIN_LOCKOUT_SECS.
-/// A successful login resets the counter.
 static LOGIN_FAIL_COUNT: AtomicU32 = AtomicU32::new(0);
 static LOGIN_FAIL_LAST: AtomicU32 = AtomicU32::new(0);
 
 const LOGIN_MAX_FAILS: u32 = 5;
 const LOGIN_LOCKOUT_SECS: u64 = 60;
-/// Per-attempt delay on a wrong password — slows down manual and scripted attacks.
 const LOGIN_FAIL_DELAY_MS: u64 = 2000;
 
-const SESSION_TTL_SECS: u32 = 900; // 15 minutes idle timeout
+const SESSION_TTL_SECS: u32 = 900;
 
-/// Mint a new session token (simple LCG-based pseudo-random, sufficient here).
 fn mint_session_token(seed: u64) -> u64 {
     seed.wrapping_mul(6364136223846793005)
         .wrapping_add(1442695040888963407)
 }
 
-/// Validate the session cookie from a request. Returns `true` if the cookie is
-/// present, matches the live token, and is within the idle TTL.
-///
-/// `refresh` controls the sliding window: real navigation (GET /, POST /save…)
-/// passes `true` to extend the TTL; the background /state poller passes `false`,
-/// so an idle tab can't keep the session alive forever just by polling. This is
-/// what makes the server-side auto-logout reliable even if the JS timer fails.
+// `refresh=false` (background /state poll) does not slide the idle TTL, so an
+// abandoned tab cannot keep the session alive by polling.
 fn validate_session(req: &str, refresh: bool) -> bool {
     let token_hi = SESSION_TOKEN_HI.load(Ordering::Relaxed);
     let token_lo = SESSION_TOKEN_LO.load(Ordering::Relaxed);
@@ -465,8 +487,6 @@ fn validate_session(req: &str, refresh: bool) -> bool {
         None => return false,
     };
 
-    // Constant-time-ish comparison: compare as u64 (the cookie value is the decimal
-    // representation of the token).
     let parsed: u64 = match core::str::from_utf8(cookie_token)
         .ok()
         .and_then(|s| s.parse().ok())
@@ -483,20 +503,17 @@ fn validate_session(req: &str, refresh: bool) -> bool {
     let now = Instant::now().as_secs();
 
     if now.saturating_sub(created) > SESSION_TTL_SECS as u64 {
-        // Session expired — clear it
         SESSION_TOKEN_HI.store(0, Ordering::Relaxed);
         SESSION_TOKEN_LO.store(0, Ordering::Relaxed);
         return false;
     }
 
-    // Slide the TTL forward only on real activity (not background polling).
     if refresh {
         SESSION_CREATED.store(now as u32, Ordering::Relaxed);
     }
     true
 }
 
-/// Extract a named cookie value from the HTTP Cookie header.
 fn extract_cookie<'a>(req: &'a str, name: &str) -> Option<&'a [u8]> {
     const PREFIX: &str = "cookie:";
     for line in req.lines() {
@@ -516,14 +533,10 @@ fn extract_cookie<'a>(req: &'a str, name: &str) -> Option<&'a [u8]> {
     None
 }
 
-/// Two-socket web pool. Both instances run the identical router (`serve_connection`),
-/// so either socket can serve a normal request OR the long-lived `GET /events`
-/// SSE stream — a request never lands on a socket that can't handle it. One
-/// socket can be parked in an SSE stream while the other keeps serving the page,
-/// /state, /save, etc. Sockets come from the `StackResources<8>` pool in main.
-///
-/// Each instance needs its OWN buffers; embassy tasks can't share `StaticCell`s,
-/// hence two near-identical task fns rather than a spawned-N loop.
+// Two-socket pool: both instances run the identical router, so either socket
+// can serve a normal request OR park in the long-lived /events SSE stream while
+// the other keeps serving. Each instance must own its buffers (embassy tasks
+// can't share StaticCells), hence two near-identical task fns.
 #[embassy_executor::task]
 pub async fn web_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: ResetReason) {
     info!("WEB: waiting for link...");
@@ -541,8 +554,6 @@ pub async fn web_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: R
     serve_pool(stack, cfg, reset_reason, rx_buf, tx_buf, req_buf).await;
 }
 
-/// Second pool instance — see [`web_task`]. Exists only to own a distinct set of
-/// `StaticCell` buffers.
 #[embassy_executor::task]
 pub async fn web_task_b(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: ResetReason) {
     stack.wait_link_up().await;
@@ -558,8 +569,6 @@ pub async fn web_task_b(stack: Stack<'static>, cfg: NetworkConfig, reset_reason:
     serve_pool(stack, cfg, reset_reason, rx_buf, tx_buf, req_buf).await;
 }
 
-/// The accept loop shared by both pool instances. Holds the per-instance buffers
-/// and the auth setup; delegates each accepted connection to `serve_connection`.
 async fn serve_pool(
     stack: Stack<'static>,
     cfg: NetworkConfig,
@@ -568,7 +577,6 @@ async fn serve_pool(
     tx_buf: &mut [u8],
     req_buf: &mut [u8],
 ) {
-    // Auth disabled when both web_user and web_pass are empty (open LAN device).
     let auth_required = !cfg.web_user.is_empty() || !cfg.web_pass.is_empty();
     let expected_token =
         jzf407_logic::auth::basic_token(cfg.web_user.as_str(), cfg.web_pass.as_str());
@@ -578,15 +586,13 @@ async fn serve_pool(
         warn!("WEB: no web password set — page is open to anyone who can reach it");
     }
 
-    // Seed the token generator with the current uptime (monotonic, no RTC needed).
     let token_seed = Instant::now().as_secs().wrapping_mul(0x9E3779B97F4A7C15);
 
     loop {
         let mut socket = TcpSocket::new(stack, &mut *rx_buf, &mut *tx_buf);
         socket.set_timeout(Some(Duration::from_secs(10)));
-        // Disable Nagle: with ~30 small write_all() calls per page, Nagle + the
-        // host's delayed-ACK (40–200 ms) would stall each write until the previous
-        // segment is ACKed, making the page take several seconds to load.
+        // Nagle + the host's delayed-ACK would stall each of the ~30 small
+        // write_all() calls per page, making the page take seconds to load.
         socket.set_nagle_enabled(false);
 
         if socket.accept(80).await.is_err() {
@@ -606,13 +612,9 @@ async fn serve_pool(
         )
         .await;
 
-        // Graceful TCP shutdown so the browser sees a clean FIN, not a RST.
-        // `close()` only QUEUES the FIN; if we drop the socket immediately (or
-        // reuse the rx/tx buffers via TcpSocket::new on the next iteration)
-        // smoltcp aborts the connection and sends RST. We have to wait for the
-        // FIN to actually leave the wire. `flush()` returns once the send queue
-        // (incl. FIN) is drained or the peer acks. The select() bounds it so a
-        // misbehaving peer can't park this socket forever.
+        // close() only QUEUES the FIN; dropping the socket (or reusing its
+        // buffers next iteration) before the flush would abort with RST and
+        // break the browser's fetch. The select() bounds a misbehaving peer.
         socket.close();
         let _ = embassy_futures::select::select(
             socket.flush(),
@@ -622,9 +624,6 @@ async fn serve_pool(
     }
 }
 
-/// Handle one accepted connection: read the request, run the auth gate, route to
-/// the matching handler (incl. the `/events` SSE stream), and close. Lives apart
-/// from the accept loop so both pool instances share exactly one router.
 #[allow(clippy::too_many_arguments)]
 async fn serve_connection(
     socket: &mut TcpSocket<'_>,
@@ -636,225 +635,204 @@ async fn serve_connection(
     expected_token: &str,
     token_seed: u64,
 ) {
-        let n = match socket.read(req_buf).await {
-            Ok(n) if n > 0 => n,
-            _ => return,
-        };
+    let n = match socket.read(req_buf).await {
+        Ok(n) if n > 0 => n,
+        _ => return,
+    };
 
-        let req = match core::str::from_utf8(&req_buf[..n]) {
-            Ok(s) => s,
-            Err(_) => {
-                let _ = socket.write_all(HTTP_400.as_bytes()).await;
-                return;
-            }
-        };
+    let req = match core::str::from_utf8(&req_buf[..n]) {
+        Ok(s) => s,
+        Err(_) => {
+            let _ = socket.write_all(HTTP_400.as_bytes()).await;
+            return;
+        }
+    };
 
-        // Parse method + target. Split the query string off the path so routing
-        // and TTL logic see a clean path (e.g. "/state?active=1" → "/state").
-        let first_line = req.lines().next().unwrap_or("");
-        let mut parts = first_line.split_whitespace();
-        let method = parts.next().unwrap_or("");
-        let target = parts.next().unwrap_or("/");
-        let (path, query) = match target.split_once('?') {
-            Some((p, q)) => (p, q),
-            None => (target, ""),
-        };
+    let first_line = req.lines().next().unwrap_or("");
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("/");
+    let (path, query) = match target.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (target, ""),
+    };
 
-        // --- Auth gate ---
-        // Form-login + session-cookie only (no HTTP Basic Auth). Browsers cache
-        // Basic credentials and auto-resend them, which makes logout impossible;
-        // a cookie session can be cleared server-side and in the browser, so
-        // logout actually works. Auth flow: valid cookie → in; otherwise the
-        // /login form mints a cookie on correct credentials.
-        //
-        // Idle-TTL sliding: real navigation always refreshes it. The /state poll
-        // and the long-lived /events stream refresh it ONLY when the page reports
-        // recent user activity (?active=1 on /state) — so an open-but-abandoned
-        // tab can't keep the session alive by polling or by holding /events open,
-        // but an actively-used page stays logged in.
-        let refresh_ttl = !(path == "/state" || path == "/events") || query.contains("active=1");
-        let authenticated = !auth_required || validate_session(req, refresh_ttl);
+    // Auth gate: form login + session cookie only (no HTTP Basic Auth —
+    // browsers cache Basic credentials, making logout impossible). /state
+    // and /events slide the idle TTL only when the page reports activity.
+    let refresh_ttl = !(path == "/state" || path == "/events") || query.contains("active=1");
+    let authenticated = !auth_required || validate_session(req, refresh_ttl);
 
-        if !authenticated {
-            if method == "POST" && path == "/login" {
-                let now = Instant::now().as_secs();
-                let fails = LOGIN_FAIL_COUNT.load(Ordering::Relaxed);
-                let last_fail = LOGIN_FAIL_LAST.load(Ordering::Relaxed) as u64;
+    if !authenticated {
+        if method == "POST" && path == "/login" {
+            let now = Instant::now().as_secs();
+            let fails = LOGIN_FAIL_COUNT.load(Ordering::Relaxed);
+            let last_fail = LOGIN_FAIL_LAST.load(Ordering::Relaxed) as u64;
 
-                // Lockout: too many consecutive failures and the window hasn't expired.
-                if fails >= LOGIN_MAX_FAILS
-                    && now.saturating_sub(last_fail) < LOGIN_LOCKOUT_SECS
-                {
-                    warn!("WEB: login locked out ({} fails)", fails);
-                    w(socket, HTTP_401_LOGIN).await;
-                    w(socket, LOGIN_HEAD).await;
-                    w(socket, LOGIN_LOCKED).await;
-                    w(socket, LOGIN_TAIL).await;
-                    let _ = socket.flush().await;
-                    socket.close();
-                    return;
-                }
-
-                if fails >= LOGIN_MAX_FAILS {
-                    LOGIN_FAIL_COUNT.store(0, Ordering::Relaxed);
-                }
-
-                let login_ok = if let Some(body_start) = req.find("\r\n\r\n") {
-                    let body = &req[body_start + 4..];
-                    let (user_opt, pass_opt) = parse_login_form(body);
-                    if let (Some(u), Some(p)) = (user_opt, pass_opt) {
-                        let submitted = jzf407_logic::auth::basic_token(u.as_str(), p.as_str());
-                        submitted.as_str() == expected_token
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-
-                if login_ok {
-                    LOGIN_FAIL_COUNT.store(0, Ordering::Relaxed);
-                    let new_token =
-                        mint_session_token(token_seed.wrapping_add(Instant::now().as_secs()));
-                    SESSION_TOKEN_HI.store((new_token >> 32) as u32, Ordering::Relaxed);
-                    SESSION_TOKEN_LO.store(new_token as u32, Ordering::Relaxed);
-                    SESSION_CREATED.store(Instant::now().as_secs() as u32, Ordering::Relaxed);
-                    let mut redirect: HString<256> = HString::new();
-                    let _ = core::fmt::Write::write_fmt(
-                        &mut redirect,
-                        format_args!(
-                            "HTTP/1.1 303 See Other\r\nSet-Cookie: jzf_session={}; Path=/; Max-Age=1800; HttpOnly; SameSite=Strict\r\nLocation: /\r\nConnection: close\r\n\r\n",
-                            new_token
-                        ),
-                    );
-                    w(socket, redirect.as_str()).await;
-                    let _ = socket.flush().await;
-                    socket.close();
-                    return;
-                }
-
-                let new_fails = LOGIN_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                LOGIN_FAIL_LAST.store(Instant::now().as_secs() as u32, Ordering::Relaxed);
-                warn!("WEB: failed login attempt #{}", new_fails);
-
-                // Delay before responding — slows brute-force and signals to the user
-                // that the credentials were actually checked (not an instant redirect).
-                Timer::after(Duration::from_millis(LOGIN_FAIL_DELAY_MS)).await;
-
-                let msg = if new_fails >= LOGIN_MAX_FAILS {
-                    LOGIN_LOCKED
-                } else {
-                    LOGIN_ERROR
-                };
+            if fails >= LOGIN_MAX_FAILS && now.saturating_sub(last_fail) < LOGIN_LOCKOUT_SECS {
+                warn!("WEB: login locked out ({} fails)", fails);
                 w(socket, HTTP_401_LOGIN).await;
                 w(socket, LOGIN_HEAD).await;
-                w(socket, msg).await;
+                w(socket, LOGIN_LOCKED).await;
                 w(socket, LOGIN_TAIL).await;
                 let _ = socket.flush().await;
                 socket.close();
                 return;
             }
 
-            // Unauthenticated /events: 401 + close so the EventSource errors out
-            // and the page falls back to /state polling (which 401s → /login).
-            // No login form body on this path — it isn't a navigable page.
-            if path == "/events" {
-                w(socket, HTTP_401_LOGIN).await;
+            if fails >= LOGIN_MAX_FAILS {
+                LOGIN_FAIL_COUNT.store(0, Ordering::Relaxed);
+            }
+
+            let login_ok = if let Some(body_start) = req.find("\r\n\r\n") {
+                let body = &req[body_start + 4..];
+                let (user_opt, pass_opt) = parse_login_form(body);
+                if let (Some(u), Some(p)) = (user_opt, pass_opt) {
+                    let submitted = jzf407_logic::auth::basic_token(u.as_str(), p.as_str());
+                    submitted.as_str() == expected_token
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if login_ok {
+                LOGIN_FAIL_COUNT.store(0, Ordering::Relaxed);
+                let new_token =
+                    mint_session_token(token_seed.wrapping_add(Instant::now().as_secs()));
+                SESSION_TOKEN_HI.store((new_token >> 32) as u32, Ordering::Relaxed);
+                SESSION_TOKEN_LO.store(new_token as u32, Ordering::Relaxed);
+                SESSION_CREATED.store(Instant::now().as_secs() as u32, Ordering::Relaxed);
+                let mut redirect: HString<256> = HString::new();
+                let _ = core::fmt::Write::write_fmt(
+                        &mut redirect,
+                        format_args!(
+                            "HTTP/1.1 303 See Other\r\nSet-Cookie: jzf_session={}; Path=/; Max-Age=1800; HttpOnly; SameSite=Strict\r\nLocation: /\r\nConnection: close\r\n\r\n",
+                            new_token
+                        ),
+                    );
+                w(socket, redirect.as_str()).await;
                 let _ = socket.flush().await;
                 socket.close();
                 return;
             }
 
-            // Not authenticated and not a login POST: show the login form.
-            // If a (now-invalid/expired) session cookie is present, expire it in
-            // the same response so the browser drops it. No WWW-Authenticate
-            // header anywhere — the browser must never pop its native Basic dialog.
-            if extract_cookie(req, "jzf_session").is_some() {
-                w(socket, HTTP_401_EXPIRE_COOKIE).await;
+            let new_fails = LOGIN_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            LOGIN_FAIL_LAST.store(Instant::now().as_secs() as u32, Ordering::Relaxed);
+            warn!("WEB: failed login attempt #{}", new_fails);
+
+            // Slows brute-force.
+            Timer::after(Duration::from_millis(LOGIN_FAIL_DELAY_MS)).await;
+
+            let msg = if new_fails >= LOGIN_MAX_FAILS {
+                LOGIN_LOCKED
             } else {
-                w(socket, HTTP_401_LOGIN).await;
-            }
+                LOGIN_ERROR
+            };
+            w(socket, HTTP_401_LOGIN).await;
             w(socket, LOGIN_HEAD).await;
+            w(socket, msg).await;
             w(socket, LOGIN_TAIL).await;
             let _ = socket.flush().await;
             socket.close();
             return;
         }
 
-        match (method, path) {
-            ("GET", "/") => {
-                send_page(socket, cfg, stack, reset_reason).await;
-                // Graceful FIN so the browser gets a clean EOF, not a RST.
-                // Without this, drop() calls abort() → RST → fetch('/state')
-                // fails with ERR_CONNECTION_RESET and live updates stop working.
-                socket.close();
-            }
-            // Live push stream. Holds THIS socket open for the life of the page;
-            // the other pool instance keeps serving everything else. Authenticated
-            // by the gate above (same session as the rest of the site).
-            ("GET", "/events") => {
-                crate::sse::serve_events(socket, stack).await;
-                socket.close();
-            }
-            ("GET", "/login") => {
-                let _ = socket.write_all(HTTP_303_HOME.as_bytes()).await;
-                let _ = socket.flush().await;
-                socket.close();
-            }
-            ("GET", "/state") => {
-                send_state(socket, cfg, stack, reset_reason).await;
-                socket.close();
-            }
-            ("POST", "/logout") => {
-                SESSION_TOKEN_HI.store(0, Ordering::Relaxed);
-                SESSION_TOKEN_LO.store(0, Ordering::Relaxed);
-                SESSION_CREATED.store(0, Ordering::Relaxed);
-                info!("WEB: user logged out");
-                let _ = socket.write_all(HTTP_303_LOGOUT.as_bytes()).await;
-                let _ = socket.flush().await;
-                socket.close();
-            }
-            ("POST", "/reboot") => {
-                let _ = socket.write_all(HTTP_OK.as_bytes()).await;
-                let _ = socket
+        // Unauthenticated /events: 401 + close so the EventSource errors out
+        // and the page falls back to /state polling (which 401s → /login).
+        if path == "/events" {
+            w(socket, HTTP_401_LOGIN).await;
+            let _ = socket.flush().await;
+            socket.close();
+            return;
+        }
+
+        // Show the login form; expire a stale session cookie in the same response.
+        if extract_cookie(req, "jzf_session").is_some() {
+            w(socket, HTTP_401_EXPIRE_COOKIE).await;
+        } else {
+            w(socket, HTTP_401_LOGIN).await;
+        }
+        w(socket, LOGIN_HEAD).await;
+        w(socket, LOGIN_TAIL).await;
+        let _ = socket.flush().await;
+        socket.close();
+        return;
+    }
+
+    match (method, path) {
+        ("GET", "/") => {
+            send_page(socket, cfg, stack, reset_reason).await;
+            socket.close();
+        }
+        ("GET", "/events") => {
+            crate::sse::serve_events(socket, stack).await;
+            socket.close();
+        }
+        ("GET", "/login") => {
+            let _ = socket.write_all(HTTP_303_HOME.as_bytes()).await;
+            let _ = socket.flush().await;
+            socket.close();
+        }
+        ("GET", "/state") => {
+            send_state(socket, cfg, stack, reset_reason).await;
+            socket.close();
+        }
+        ("POST", "/logout") => {
+            SESSION_TOKEN_HI.store(0, Ordering::Relaxed);
+            SESSION_TOKEN_LO.store(0, Ordering::Relaxed);
+            SESSION_CREATED.store(0, Ordering::Relaxed);
+            info!("WEB: user logged out");
+            let _ = socket.write_all(HTTP_303_LOGOUT.as_bytes()).await;
+            let _ = socket.flush().await;
+            socket.close();
+        }
+        ("POST", "/reboot") => {
+            let _ = socket.write_all(HTTP_OK.as_bytes()).await;
+            let _ = socket
                     .write_all(b"<html><head><meta http-equiv=refresh content='4;url=/'></head><body><p>Rebooting... <a href=/>back in 4s</a></p></body></html>")
                     .await;
-                let _ = socket.flush().await;
-                socket.close();
-                Timer::after(Duration::from_millis(300)).await;
-                warn!("WEB: /reboot triggered sys_reset");
-                crate::fault_marker::safe_reboot();
-            }
-            ("POST", "/save") => {
-                if let Some(body) = req.find("\r\n\r\n").map(|i| &req[i + 4..]) {
-                    match parse_form(body, cfg) {
-                        Some(new_cfg) => {
-                            let _ = socket.write_all(HTTP_OK.as_bytes()).await;
-                            let _ = socket
-                                .write_all(b"<html><head><meta http-equiv=refresh content='4;url=/'></head><body><p>Saved. Rebooting... <a href=/>back in 4s</a></p></body></html>")
-                                .await;
+            let _ = socket.flush().await;
+            socket.close();
+            Timer::after(Duration::from_millis(300)).await;
+            warn!("WEB: /reboot triggered sys_reset");
+            crate::fault_marker::safe_reboot();
+        }
+        ("POST", "/save") => {
+            if let Some(body) = req.find("\r\n\r\n").map(|i| &req[i + 4..]) {
+                match parse_form(body, cfg) {
+                    Some(new_cfg) => {
+                        if crate::config::save_config(&new_cfg).await.is_err() {
+                            warn!("WEB: EEPROM save failed");
+                            let _ = socket.write_all(HTTP_500.as_bytes()).await;
                             let _ = socket.flush().await;
                             socket.close();
-                            Timer::after(Duration::from_millis(200)).await;
-                            if crate::config::save_config(&new_cfg).await.is_err() {
-                                warn!("WEB: save failed");
-                            }
-                            warn!("WEB: /save triggered sys_reset");
-                            crate::fault_marker::safe_reboot();
+                            return;
                         }
-                        None => {
-                            let _ = socket.write_all(HTTP_400.as_bytes()).await;
-                        }
+                        let _ = socket.write_all(HTTP_OK.as_bytes()).await;
+                        let _ = socket
+                                .write_all(b"<html><head><meta http-equiv=refresh content='4;url=/'></head><body><p>Saved. Rebooting... <a href=/>back in 4s</a></p></body></html>")
+                                .await;
+                        let _ = socket.flush().await;
+                        socket.close();
+                        Timer::after(Duration::from_millis(200)).await;
+                        warn!("WEB: /save triggered sys_reset");
+                        crate::fault_marker::safe_reboot();
                     }
-                } else {
-                    let _ = socket.write_all(HTTP_400.as_bytes()).await;
+                    None => {
+                        let _ = socket.write_all(HTTP_400.as_bytes()).await;
+                    }
                 }
-            }
-            _ => {
-                let _ = socket.write_all(HTTP_404.as_bytes()).await;
-                socket.close();
+            } else {
+                let _ = socket.write_all(HTTP_400.as_bytes()).await;
             }
         }
+        _ => {
+            let _ = socket.write_all(HTTP_404.as_bytes()).await;
+            socket.close();
+        }
+    }
 }
 
 fn parse_form(body: &str, current: &NetworkConfig) -> Option<NetworkConfig> {
@@ -870,9 +848,7 @@ fn parse_form(body: &str, current: &NetworkConfig) -> Option<NetworkConfig> {
                 cfg.ip = parse_ipv4(&val)?;
             }
             "prefix" => {
-                // Reject 0 and >32: smoltcp's Ipv4Cidr::new asserts prefix_len<=32
-                // and would panic at boot, bricking the board into a reset loop
-                // until the EEPROM is wiped. Treat as invalid form (→ 400).
+                // 0 or >32 would panic in Ipv4Cidr::new at boot → reset loop.
                 let p = val.parse::<u8>().ok()?;
                 if !(1..=32).contains(&p) {
                     return None;
@@ -891,7 +867,6 @@ fn parse_form(body: &str, current: &NetworkConfig) -> Option<NetworkConfig> {
             "id" => {
                 cfg.client_id = HString::try_from(val.as_str()).ok()?;
             }
-            // Credentials: a value longer than the 32-byte field is rejected (→ 400).
             "muser" => {
                 cfg.mqtt_user = HString::try_from(val.as_str()).ok()?;
             }
@@ -910,8 +885,6 @@ fn parse_form(body: &str, current: &NetworkConfig) -> Option<NetworkConfig> {
     Some(cfg)
 }
 
-
-/// Extract url-decoded `user` and `pass` values from a POST /login form body.
 fn parse_login_form(body: &str) -> (Option<HString<64>>, Option<HString<64>>) {
     let mut user = None;
     let mut pass = None;

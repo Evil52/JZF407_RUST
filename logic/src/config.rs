@@ -1,34 +1,20 @@
-//! Network configuration persisted in the AT24C02 EEPROM at byte offset 16
-//! (runtime output state lives separately at offset 0 — see `persistence`).
+//! Network config persisted in AT24C02 at byte offset 16 (output state lives at 0).
 //!
-//! On-EEPROM layout: 175 bytes spanning [16..191), addresses absolute:
-//!   [16..20)   magic 0xC0 0x4F 0x19 0x1E  — rejects blank / foreign EEPROMs
-//!   [20..24)   device IP (4 octets)
-//!   [24]       prefix_len (CIDR bits, e.g. 24);  [25..28) unused
-//!   [28..32)   gateway (4 octets)
-//!   [32..36)   broker IP (4 octets)
-//!   [36..38)   broker port (big-endian u16)
-//!   [38]       reserved (was a DHCP flag; firmware is static-IP only)
-//!   [39..63)   client_id, NUL-terminated, max 24 bytes
-//!   [63..95)   MQTT username, NUL-terminated, max 32 bytes
-//!   [95..127)  MQTT password, NUL-terminated, max 32 bytes
-//!   [127..159) web (HTTP Basic Auth) username, NUL-terminated, max 32 bytes
-//!   [159..191) web (HTTP Basic Auth) password, NUL-terminated, max 32 bytes
+//! On-EEPROM layout, 175 bytes at 16..191, addresses absolute:
+//! ```text
+//!   [16..20)   magic 0xC0 0x4F 0x19 0x1E
+//!   [20..24)   device IP;  [24] prefix_len;  [25..28) unused
+//!   [28..32)   gateway
+//!   [32..36)   broker IP;  [36..38) broker port (BE u16);  [38] reserved
+//!   [39..63)   client_id, NUL-terminated, max 24
+//!   [63..95)   MQTT user;   [95..127)  MQTT pass   (NUL-terminated, max 32)
+//!   [127..159) web user;    [159..191) web pass    (NUL-terminated, max 32)
+//! ```
 //!
-//! The four credential fields were appended after the original 49-byte layout.
-//! A device flashed before this change has 0xFF (blank) in [63..191); those
-//! bytes parse leniently to empty strings (see `read_str`), so an upgrade keeps
-//! the existing network config and simply boots with no credentials configured
-//! (anonymous MQTT + open web page) — exactly the pre-auth behaviour.
-//!
-//! Validation is deliberately conservative: a wrong magic, invalid CIDR prefix,
-//! zero broker port, or invalid client_id all make parsing fail so the firmware
-//! falls back to Default. There is no CRC — a torn EEPROM write can still yield
-//! a plausible struct, so callers treat a bad-looking config by reverting to
-//! defaults, not by trusting it.
-//!
-//! These are plain-data structs with no hardware deps, so (de)serialisation is
-//! unit-tested natively on the host — see tests/config_parser.rs.
+//! No CRC: parsing validates magic, prefix_len (1..=32 — anything else would
+//! panic in Ipv4Cidr::new at boot and reset-loop the board) and non-zero port;
+//! any failure falls back to Default. Credential slots parse leniently to empty
+//! strings so a pre-credentials EEPROM image keeps its network config.
 
 pub const DEFAULT_IP: [u8; 4] = [192, 168, 137, 2];
 pub const DEFAULT_GW: [u8; 4] = [192, 168, 137, 1];
@@ -39,13 +25,7 @@ pub const DEFAULT_ID: &str = "stm32-jzf407";
 
 const MAGIC: [u8; 4] = [0xC0, 0x4F, 0x19, 0x1E];
 
-/// Total size of the serialised config image in EEPROM (the firmware reads/writes
-/// exactly this many bytes starting at offset 16). Public so the firmware side
-/// can size its buffer from one source of truth.
 pub const LEN: usize = 175;
-
-/// Max length (in bytes) of each credential field. Matches the heapless::String
-/// capacity below and the on-EEPROM slot width.
 pub const CRED_MAX: usize = 32;
 
 #[derive(Clone, Debug)]
@@ -56,13 +36,9 @@ pub struct NetworkConfig {
     pub broker_ip: [u8; 4],
     pub broker_port: u16,
     pub client_id: heapless::String<24>,
-    /// MQTT CONNECT username. Empty = connect anonymously (no auth sent).
     pub mqtt_user: heapless::String<CRED_MAX>,
-    /// MQTT CONNECT password. Empty = no password sent.
     pub mqtt_pass: heapless::String<CRED_MAX>,
-    /// HTTP Basic Auth username. Empty user AND pass = web page is open (no auth).
     pub web_user: heapless::String<CRED_MAX>,
-    /// HTTP Basic Auth password.
     pub web_pass: heapless::String<CRED_MAX>,
 }
 
@@ -83,13 +59,6 @@ impl Default for NetworkConfig {
     }
 }
 
-/// Read a NUL-terminated string field from an EEPROM slice, leniently.
-///
-/// Used for the credential fields, which may be 0xFF (blank) on a device flashed
-/// before they existed. Anything that isn't valid UTF-8 up to the first NUL (or
-/// the end of the slot) yields an empty string rather than failing the whole
-/// config parse — so an upgrade never wipes the network config, it just boots
-/// with no credentials.
 fn read_str<const N: usize>(slot: &[u8]) -> heapless::String<N> {
     let end = slot.iter().position(|&c| c == 0).unwrap_or(slot.len());
     match core::str::from_utf8(&slot[..end]) {
@@ -99,8 +68,6 @@ fn read_str<const N: usize>(slot: &[u8]) -> heapless::String<N> {
 }
 
 impl NetworkConfig {
-    /// Serialise into the fixed 49-byte EEPROM image. Offsets here are relative
-    /// to the buffer start (EEPROM byte 16); see the module-level layout doc.
     pub fn to_bytes(&self) -> [u8; LEN] {
         let mut b = [0u8; LEN];
         b[0..4].copy_from_slice(&MAGIC);
@@ -110,12 +77,10 @@ impl NetworkConfig {
         b[16..20].copy_from_slice(&self.broker_ip);
         b[20] = (self.broker_port >> 8) as u8;
         b[21] = self.broker_port as u8;
-        // b[22] is reserved (former DHCP flag) — left zero to keep the layout stable.
         let id = self.client_id.as_bytes();
         let n = id.len().min(24);
         b[23..23 + n].copy_from_slice(&id[..n]);
 
-        // Credential slots: 32 bytes each, NUL-padded (the buffer starts zeroed).
         write_str(&mut b[47..79], &self.mqtt_user);
         write_str(&mut b[79..111], &self.mqtt_pass);
         write_str(&mut b[111..143], &self.web_user);
@@ -131,6 +96,7 @@ impl NetworkConfig {
             return None;
         }
 
+        // prefix_len outside 1..=32 would panic in Ipv4Cidr::new at boot.
         let prefix_len = b[8];
         if !(1..=32).contains(&prefix_len) {
             return None;
@@ -152,7 +118,6 @@ impl NetworkConfig {
             broker_ip: [b[16], b[17], b[18], b[19]],
             broker_port: port,
             client_id: heapless::String::try_from(id).ok()?,
-            // Lenient: blank/garbage credential slots → empty (see read_str).
             mqtt_user: read_str(&b[47..79]),
             mqtt_pass: read_str(&b[79..111]),
             web_user: read_str(&b[111..143]),
@@ -161,16 +126,12 @@ impl NetworkConfig {
     }
 }
 
-/// Copy a string into a fixed EEPROM slot, truncated to the slot width. The
-/// caller's buffer is pre-zeroed, so a string shorter than the slot is left
-/// NUL-terminated automatically.
 fn write_str(slot: &mut [u8], s: &str) {
     let bytes = s.as_bytes();
     let n = bytes.len().min(slot.len());
     slot[..n].copy_from_slice(&bytes[..n]);
 }
 
-/// Validate a dot-decimal IPv4 string, return `[u8;4]` or `None`.
 pub fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     let mut octets = [0u8; 4];
     let mut parts = s.splitn(4, '.');
@@ -183,7 +144,6 @@ pub fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     Some(octets)
 }
 
-/// Validate port number string.
 pub fn parse_port(s: &str) -> Option<u16> {
     let p: u16 = s.trim().parse().ok()?;
     if p == 0 {

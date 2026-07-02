@@ -46,10 +46,8 @@ static STACK_RESOURCES: StaticCell<StackResources<8>> = StaticCell::new();
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    // 168 MHz from 25 MHz HSE crystal (HseMode::Oscillator confirmed working).
-    // APB1 = 42 MHz, APB2 = 84 MHz, TIM2 input = 84 MHz.
-    // tick-hz-1_000_000 → TIM2 PSC = 83 (fits in u16). Do NOT use tick-hz-1_000
-    // at 168 MHz — that would require PSC=83999 which overflows u16 and panics.
+    // 168 MHz from 25 MHz HSE. Do NOT use tick-hz-1_000 at 168 MHz — TIM2 would
+    // need PSC=83999, which overflows u16 and panics inside embassy_stm32::init().
     let mut rcc_cfg = embassy_stm32::rcc::Config::default();
     rcc_cfg.hse = Some(Hse {
         freq: Hertz(25_000_000),
@@ -72,29 +70,19 @@ async fn main(spawner: Spawner) {
     p_cfg.rcc = rcc_cfg;
     let mut p = embassy_stm32::init(p_cfg);
 
-    // Enable CoreSight trace (DEMCR.TRCENA). Without this bit set, ETH DMA
-    // does not function correctly on STM32F4 when no debugger is attached.
+    // DEMCR.TRCENA: without CoreSight trace enabled, ETH DMA does not run
+    // correctly on STM32F4 with no debugger attached.
     //
-    // Safety: DEMCR is the Debug Exception and Monitor Control Register, a fixed
-    // memory-mapped register inside the Cortex-M Private Peripheral Bus at the
-    // architecturally-defined address 0xE000EDFC. It is always present and
-    // word-aligned, so the volatile read and write can neither fault nor be
-    // misaligned. No Rust object lives at this address, so there is no reference
-    // to alias and nothing to leak. The read-modify-write that ORs in TRCENA is
-    // race-free because we run it during early boot: this is before any other
-    // task is spawned and before the executor enables interrupts, so we are the
-    // sole accessor of the register at this point. Volatile guarantees the
-    // hardware side effect is not elided or reordered away.
+    // Safety: DEMCR (0xE000EDFC) is an architecturally-fixed, always-mapped,
+    // word-aligned Cortex-M register; no Rust object lives there. The RMW is
+    // race-free — early boot, before tasks are spawned or interrupts enabled.
     unsafe {
         const DEMCR: *mut u32 = 0xE000_EDFC as *mut u32;
         core::ptr::write_volatile(DEMCR, core::ptr::read_volatile(DEMCR) | (1 << 24));
     }
 
-    // Keep ETH MAC clocked while the core is in sleep (WFI/WFE). The Embassy
-    // executor sleeps the core when idle; with a debugger attached the debug
-    // domain keeps clocks alive, masking the issue. Without it, ETH DMA loses
-    // its clock in sleep and RX stops. Setting these LP-enable bits keeps the
-    // ETH clocks running in sleep so RX works with no debugger attached.
+    // Keep ETH clocked in WFI sleep: the executor sleeps the core when idle and
+    // without these LP-enable bits ETH RX dies with no debugger attached.
     {
         use embassy_stm32::pac::RCC;
         RCC.ahb1lpenr().modify(|w| {
@@ -119,12 +107,11 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(watchdog::watchdog_task(p.IWDG).unwrap());
 
-    // ---- I2C1 bus recovery: 9 SCL pulses to unstick AT24C02 after soft reset ----
-    // After SCB::sys_reset() the EEPROM may be mid-transaction holding SDA low,
-    // which causes blocking_write_read to hang forever before the executor starts.
+    // I2C1 bus recovery: after sys_reset the AT24C02 may be mid-transaction
+    // holding SDA low; the first blocking read would then hang forever.
+    // 9 SCL pulses + STOP unstick it before the I2C peripheral is initialised.
     {
-        // ~5 µs half-period for 100 kHz I2C at 168 MHz: 168*5 = 840 cycles
-        const HALF: u32 = 840;
+        const HALF: u32 = 840; // ~5 µs half-period for 100 kHz at 168 MHz
         let mut scl = OutputOpenDrain::new(p.PB8.reborrow(), Level::High, Speed::Low);
         let mut sda = OutputOpenDrain::new(p.PB9.reborrow(), Level::High, Speed::Low);
         for _ in 0..9 {
@@ -136,7 +123,6 @@ async fn main(spawner: Spawner) {
                 break;
             }
         }
-        // STOP condition: SCL high, SDA low→high
         scl.set_low();
         cortex_m::asm::delay(HALF);
         sda.set_low();
@@ -174,13 +160,7 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(outputs::relay_task(&OUTPUTS).unwrap());
 
-    // buttons_task отключена — логика управления выходами не реализована.
-    // Когда будет готова: spawner.spawn(buttons::buttons_task(p.PE10, p.PE11).unwrap());
-    // Пины PE10 (S1) и PE11 (S2) свободны — не передаём p.PE10/p.PE11 никуда.
-
-    // PA1=REF_CLK, PA2=MDIO, PA7=CRS_DV
-    // PB11=TX_EN, PB12=TXD0, PB13=TXD1
-    // PC1=MDC,  PC4=RXD0, PC5=RXD1
+    // buttons_task deliberately not spawned — see src/buttons.rs.
 
     let raw_uid = uid::uid();
     let mac_addr = [
@@ -194,8 +174,7 @@ async fn main(spawner: Spawner) {
     let queue = PACKET_QUEUE.init(PacketQueue::<4, 4>::new());
 
     let eth = eth::Ethernet::new(
-        queue, p.ETH, Irqs,
-        p.PA1,  // REF_CLK
+        queue, p.ETH, Irqs, p.PA1,  // REF_CLK
         p.PA7,  // CRS_DV
         p.PC4,  // RXD0
         p.PC5,  // RXD1
@@ -203,7 +182,7 @@ async fn main(spawner: Spawner) {
         p.PB13, // TXD1
         p.PB11, // TX_EN
         mac_addr, p.ETH_SMA, p.PA2, // MDIO
-        p.PC1,  // MDC
+        p.PC1, // MDC
     );
 
     let [ga, gb, gc, gd] = net_cfg.gateway;
@@ -220,8 +199,7 @@ async fn main(spawner: Spawner) {
     };
     let (stack, runner) = embassy_net::new(eth, net_config, resources, seed);
 
-    // Give PHY time to complete reset and auto-negotiation before net_task starts.
-    // DP83848 needs up to 3s for auto-negotiation after soft reset.
+    // DP83848 needs up to 3 s for auto-negotiation after soft reset.
     embassy_time::Timer::after(embassy_time::Duration::from_millis(3000)).await;
 
     spawner.spawn(net::net_task(runner).unwrap());

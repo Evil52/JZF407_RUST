@@ -36,7 +36,6 @@ fn empty_user_only() {
     assert_eq!(basic_token("", "pass").as_str(), "OnBhc3M=");
 }
 
-
 #[test]
 fn max_configured_credentials_fit_token_buffer_without_truncation() {
     let user = "u".repeat(jzf407_logic::config::CRED_MAX);
@@ -44,7 +43,7 @@ fn max_configured_credentials_fit_token_buffer_without_truncation() {
     let token = basic_token(&user, &pass);
 
     let raw_len = jzf407_logic::config::CRED_MAX * 2 + 1; // user ':' pass
-    let expected_base64_len = ((raw_len + 2) / 3) * 4;
+    let expected_base64_len = raw_len.div_ceil(3) * 4;
     assert_eq!(expected_base64_len, 88);
     assert_eq!(token.len(), expected_base64_len);
     assert!(token.as_str().ends_with('='));

@@ -1,9 +1,5 @@
-//! Server-Sent Events push for the dashboard.
-//!
-//! SSE = long-lived HTTP/1.1 response (`text/event-stream`), no handshake or
-//! frame parser needed. State is polled every `POLL_MS` and pushed only on diff —
-//! this catches every change (including link up/down that smoltcp flips internally)
-//! without hooking every writer. Auth and routing live in `web::web_task`.
+//! Server-Sent Events push for the dashboard: state sampled every `POLL_MS`,
+//! pushed only on diff. Auth and routing live in `web`.
 
 use core::fmt::Write as _;
 use core::sync::atomic::Ordering;
@@ -13,28 +9,20 @@ use embassy_time::{Duration, Instant, Timer};
 use embedded_io_async::Write;
 use heapless::String as HString;
 
-/// SSE response head. No `Content-Length` + `Connection: keep-alive` = the
-/// browser holds the response open and streams events. `X-Accel-Buffering: no`
-/// and `no-cache` defeat any intermediary buffering so events arrive promptly.
+// No Content-Length + keep-alive holds the response open; X-Accel-Buffering
+// and no-cache defeat intermediary buffering.
 const SSE_HEAD: &str = "HTTP/1.1 200 OK\r\n\
 Content-Type: text/event-stream\r\n\
 Cache-Control: no-cache\r\n\
 Connection: keep-alive\r\n\
 X-Accel-Buffering: no\r\n\r\n";
 
-/// How often the stream samples state for a diff. 150 ms → a change reaches the
-/// browser in well under a fifth of a second (reads as instant), while idle
-/// state sends nothing.
 const POLL_MS: u64 = 150;
 
-/// Comment-line keep-alive cadence. A line starting with ':' is ignored by the
-/// EventSource parser but still moves bytes, so a `write` fails promptly once the
-/// client has gone away (freeing the socket) and NAT/proxies don't reap an
-/// idle-looking connection.
+// The ':' comment line is ignored by EventSource but keeps NAT/proxies from
+// reaping the connection and makes a dead peer fail the write promptly.
 const KEEPALIVE_SECS: u64 = 15;
 
-/// One bit-packed snapshot of everything the dashboard shows live. Cheap to
-/// build and compare, so the diff that gates a push is a single `!=`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Snapshot {
     relay: bool,
@@ -55,8 +43,6 @@ impl Snapshot {
         }
     }
 
-    /// Format as one SSE event: `data: {json}\n\n`. `up` (uptime secs) rides along
-    /// so the client can re-sync its locally-ticking uptime on each push.
     fn write_event<const N: usize>(&self, buf: &mut HString<N>) {
         let _ = write!(
             buf,
@@ -71,23 +57,17 @@ impl Snapshot {
     }
 }
 
-/// Stream live state over an accepted, authenticated `GET /events` socket until
-/// the client goes away. Returns when any write fails (peer gone) so the caller
-/// can close the socket and accept the next connection. The caller owns the
-/// socket lifecycle (accept/close); we only stream.
 pub async fn serve_events(socket: &mut TcpSocket<'_>, stack: Stack<'static>) {
     info!("SSE: client connected");
 
-    // A long-lived stream must not inherit the short request timeout: drop it so
-    // an idle (but alive) stream isn't torn down. A dead peer is detected by a
-    // failing keep-alive write instead. Re-armed by the caller for the next req.
+    // A long-lived stream must not inherit the short request timeout; a dead
+    // peer is detected by a failing keep-alive write instead.
     socket.set_timeout(None);
 
     if socket.write_all(SSE_HEAD.as_bytes()).await.is_err() {
         return;
     }
 
-    // Paint the truth immediately so a fresh page doesn't wait for the next change.
     let mut last = Snapshot::sample(stack);
     let mut ev: HString<128> = HString::new();
     last.write_event(&mut ev);
