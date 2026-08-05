@@ -533,39 +533,60 @@ fn extract_cookie<'a>(req: &'a str, name: &str) -> Option<&'a [u8]> {
     None
 }
 
-// Two-socket pool: both instances run the identical router, so either socket
-// can serve a normal request OR park in the long-lived /events SSE stream while
-// the other keeps serving. Each instance must own its buffers (embassy tasks
-// can't share StaticCells), hence two near-identical task fns.
+/// Two-socket web pool. Both instances run the identical router (`serve_connection`),
+/// so either socket can serve a normal request OR the long-lived `GET /events`
+/// SSE stream — a request never lands on a socket that can't handle it. One
+/// socket can be parked in an SSE stream while the other keeps serving the page,
+/// /state, /save, etc. Sockets come from the `StackResources<8>` pool in main.
+///
+/// Each instance needs its OWN buffers; embassy tasks can't share `StaticCell`s,
+/// hence each task selects a distinct `WebPoolBuffers` instance.
+struct WebPoolBuffers {
+    rx: static_cell::StaticCell<[u8; 1536]>,
+    tx: static_cell::StaticCell<[u8; 4096]>,
+    req: static_cell::StaticCell<[u8; 1536]>,
+}
+
+impl WebPoolBuffers {
+    const fn new() -> Self {
+        Self {
+            rx: static_cell::StaticCell::new(),
+            tx: static_cell::StaticCell::new(),
+            req: static_cell::StaticCell::new(),
+        }
+    }
+}
+
+static WEB_POOL_A: WebPoolBuffers = WebPoolBuffers::new();
+static WEB_POOL_B: WebPoolBuffers = WebPoolBuffers::new();
+
 #[embassy_executor::task]
 pub async fn web_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: ResetReason) {
     info!("WEB: waiting for link...");
     stack.wait_link_up().await;
     info!("WEB: link up");
     stack.wait_config_up().await;
-    info!("WEB: listening on :80 (pool A)");
-
-    static RX_BUF: static_cell::StaticCell<[u8; 1536]> = static_cell::StaticCell::new();
-    static TX_BUF: static_cell::StaticCell<[u8; 4096]> = static_cell::StaticCell::new();
-    static REQ_BUF: static_cell::StaticCell<[u8; 1536]> = static_cell::StaticCell::new();
-    let rx_buf = RX_BUF.init([0u8; 1536]);
-    let tx_buf = TX_BUF.init([0u8; 4096]);
-    let req_buf = REQ_BUF.init([0u8; 1536]);
-    serve_pool(stack, cfg, reset_reason, rx_buf, tx_buf, req_buf).await;
+    run_web_pool(stack, cfg, reset_reason, &WEB_POOL_A, "A").await;
 }
 
 #[embassy_executor::task]
 pub async fn web_task_b(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: ResetReason) {
     stack.wait_link_up().await;
     stack.wait_config_up().await;
-    info!("WEB: listening on :80 (pool B)");
+    run_web_pool(stack, cfg, reset_reason, &WEB_POOL_B, "B").await;
+}
 
-    static RX_BUF: static_cell::StaticCell<[u8; 1536]> = static_cell::StaticCell::new();
-    static TX_BUF: static_cell::StaticCell<[u8; 4096]> = static_cell::StaticCell::new();
-    static REQ_BUF: static_cell::StaticCell<[u8; 1536]> = static_cell::StaticCell::new();
-    let rx_buf = RX_BUF.init([0u8; 1536]);
-    let tx_buf = TX_BUF.init([0u8; 4096]);
-    let req_buf = REQ_BUF.init([0u8; 1536]);
+async fn run_web_pool(
+    stack: Stack<'static>,
+    cfg: NetworkConfig,
+    reset_reason: ResetReason,
+    buffers: &'static WebPoolBuffers,
+    label: &'static str,
+) {
+    info!("WEB: listening on :80 (pool {})", label);
+    let rx_buf = buffers.rx.init([0u8; 1536]);
+    let tx_buf = buffers.tx.init([0u8; 4096]);
+    let req_buf = buffers.req.init([0u8; 1536]);
     serve_pool(stack, cfg, reset_reason, rx_buf, tx_buf, req_buf).await;
 }
 
@@ -641,198 +662,299 @@ async fn serve_connection(
     };
 
     let req = match core::str::from_utf8(&req_buf[..n]) {
-        Ok(s) => s,
+        Ok(req) => req,
         Err(_) => {
             let _ = socket.write_all(HTTP_400.as_bytes()).await;
             return;
         }
     };
 
-    let first_line = req.lines().next().unwrap_or("");
-    let mut parts = first_line.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let target = parts.next().unwrap_or("/");
-    let (path, query) = match target.split_once('?') {
-        Some((p, q)) => (p, q),
-        None => (target, ""),
-    };
-
-    // Auth gate: form login + session cookie only (no HTTP Basic Auth —
-    // browsers cache Basic credentials, making logout impossible). /state
-    // and /events slide the idle TTL only when the page reports activity.
-    let refresh_ttl = !(path == "/state" || path == "/events") || query.contains("active=1");
-    let authenticated = !auth_required || validate_session(req, refresh_ttl);
-
-    if !authenticated {
-        if method == "POST" && path == "/login" {
-            let now = Instant::now().as_secs();
-            let fails = LOGIN_FAIL_COUNT.load(Ordering::Relaxed);
-            let last_fail = LOGIN_FAIL_LAST.load(Ordering::Relaxed) as u64;
-
-            if fails >= LOGIN_MAX_FAILS && now.saturating_sub(last_fail) < LOGIN_LOCKOUT_SECS {
-                warn!("WEB: login locked out ({} fails)", fails);
-                w(socket, HTTP_401_LOGIN).await;
-                w(socket, LOGIN_HEAD).await;
-                w(socket, LOGIN_LOCKED).await;
-                w(socket, LOGIN_TAIL).await;
-                let _ = socket.flush().await;
-                socket.close();
-                return;
-            }
-
-            if fails >= LOGIN_MAX_FAILS {
-                LOGIN_FAIL_COUNT.store(0, Ordering::Relaxed);
-            }
-
-            let login_ok = if let Some(body_start) = req.find("\r\n\r\n") {
-                let body = &req[body_start + 4..];
-                let (user_opt, pass_opt) = parse_login_form(body);
-                if let (Some(u), Some(p)) = (user_opt, pass_opt) {
-                    let submitted = jzf407_logic::auth::basic_token(u.as_str(), p.as_str());
-                    submitted.as_str() == expected_token
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-
-            if login_ok {
-                LOGIN_FAIL_COUNT.store(0, Ordering::Relaxed);
-                let new_token =
-                    mint_session_token(token_seed.wrapping_add(Instant::now().as_secs()));
-                SESSION_TOKEN_HI.store((new_token >> 32) as u32, Ordering::Relaxed);
-                SESSION_TOKEN_LO.store(new_token as u32, Ordering::Relaxed);
-                SESSION_CREATED.store(Instant::now().as_secs() as u32, Ordering::Relaxed);
-                let mut redirect: HString<256> = HString::new();
-                let _ = core::fmt::Write::write_fmt(
-                        &mut redirect,
-                        format_args!(
-                            "HTTP/1.1 303 See Other\r\nSet-Cookie: jzf_session={}; Path=/; Max-Age=1800; HttpOnly; SameSite=Strict\r\nLocation: /\r\nConnection: close\r\n\r\n",
-                            new_token
-                        ),
-                    );
-                w(socket, redirect.as_str()).await;
-                let _ = socket.flush().await;
-                socket.close();
-                return;
-            }
-
-            let new_fails = LOGIN_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-            LOGIN_FAIL_LAST.store(Instant::now().as_secs() as u32, Ordering::Relaxed);
-            warn!("WEB: failed login attempt #{}", new_fails);
-
-            // Slows brute-force.
-            Timer::after(Duration::from_millis(LOGIN_FAIL_DELAY_MS)).await;
-
-            let msg = if new_fails >= LOGIN_MAX_FAILS {
-                LOGIN_LOCKED
-            } else {
-                LOGIN_ERROR
-            };
-            w(socket, HTTP_401_LOGIN).await;
-            w(socket, LOGIN_HEAD).await;
-            w(socket, msg).await;
-            w(socket, LOGIN_TAIL).await;
-            let _ = socket.flush().await;
-            socket.close();
-            return;
-        }
-
-        // Unauthenticated /events: 401 + close so the EventSource errors out
-        // and the page falls back to /state polling (which 401s → /login).
-        if path == "/events" {
-            w(socket, HTTP_401_LOGIN).await;
-            let _ = socket.flush().await;
-            socket.close();
-            return;
-        }
-
-        // Show the login form; expire a stale session cookie in the same response.
-        if extract_cookie(req, "jzf_session").is_some() {
-            w(socket, HTTP_401_EXPIRE_COOKIE).await;
-        } else {
-            w(socket, HTTP_401_LOGIN).await;
-        }
-        w(socket, LOGIN_HEAD).await;
-        w(socket, LOGIN_TAIL).await;
-        let _ = socket.flush().await;
-        socket.close();
+    let request = ParsedRequest::new(req);
+    if !authenticate_request(socket, request, auth_required, expected_token, token_seed).await {
         return;
     }
 
-    match (method, path) {
-        ("GET", "/") => {
-            send_page(socket, cfg, stack, reset_reason).await;
-            socket.close();
-        }
-        ("GET", "/events") => {
-            crate::sse::serve_events(socket, stack).await;
-            socket.close();
-        }
-        ("GET", "/login") => {
-            let _ = socket.write_all(HTTP_303_HOME.as_bytes()).await;
-            let _ = socket.flush().await;
-            socket.close();
-        }
-        ("GET", "/state") => {
-            send_state(socket, cfg, stack, reset_reason).await;
-            socket.close();
-        }
-        ("POST", "/logout") => {
-            SESSION_TOKEN_HI.store(0, Ordering::Relaxed);
-            SESSION_TOKEN_LO.store(0, Ordering::Relaxed);
-            SESSION_CREATED.store(0, Ordering::Relaxed);
-            info!("WEB: user logged out");
-            let _ = socket.write_all(HTTP_303_LOGOUT.as_bytes()).await;
-            let _ = socket.flush().await;
-            socket.close();
-        }
-        ("POST", "/reboot") => {
-            let _ = socket.write_all(HTTP_OK.as_bytes()).await;
-            let _ = socket
-                    .write_all(b"<html><head><meta http-equiv=refresh content='4;url=/'></head><body><p>Rebooting... <a href=/>back in 4s</a></p></body></html>")
-                    .await;
-            let _ = socket.flush().await;
-            socket.close();
-            Timer::after(Duration::from_millis(300)).await;
-            warn!("WEB: /reboot triggered sys_reset");
-            crate::fault_marker::safe_reboot();
-        }
-        ("POST", "/save") => {
-            if let Some(body) = req.find("\r\n\r\n").map(|i| &req[i + 4..]) {
-                match parse_form(body, cfg) {
-                    Some(new_cfg) => {
-                        if crate::config::save_config(&new_cfg).await.is_err() {
-                            warn!("WEB: EEPROM save failed");
-                            let _ = socket.write_all(HTTP_500.as_bytes()).await;
-                            let _ = socket.flush().await;
-                            socket.close();
-                            return;
-                        }
-                        let _ = socket.write_all(HTTP_OK.as_bytes()).await;
-                        let _ = socket
-                                .write_all(b"<html><head><meta http-equiv=refresh content='4;url=/'></head><body><p>Saved. Rebooting... <a href=/>back in 4s</a></p></body></html>")
-                                .await;
-                        let _ = socket.flush().await;
-                        socket.close();
-                        Timer::after(Duration::from_millis(200)).await;
-                        warn!("WEB: /save triggered sys_reset");
-                        crate::fault_marker::safe_reboot();
-                    }
-                    None => {
-                        let _ = socket.write_all(HTTP_400.as_bytes()).await;
-                    }
-                }
-            } else {
-                let _ = socket.write_all(HTTP_400.as_bytes()).await;
-            }
-        }
-        _ => {
-            let _ = socket.write_all(HTTP_404.as_bytes()).await;
-            socket.close();
+    route_authenticated(socket, request, cfg, stack, reset_reason).await;
+}
+
+#[derive(Clone, Copy)]
+struct ParsedRequest<'a> {
+    raw: &'a str,
+    method: &'a str,
+    path: &'a str,
+    query: &'a str,
+}
+
+impl<'a> ParsedRequest<'a> {
+    fn new(raw: &'a str) -> Self {
+        let first_line = raw.lines().next().unwrap_or("");
+        let mut parts = first_line.split_whitespace();
+        let method = parts.next().unwrap_or("");
+        let target = parts.next().unwrap_or("/");
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+
+        Self {
+            raw,
+            method,
+            path,
+            query,
         }
     }
+
+    fn body(self) -> Option<&'a str> {
+        self.raw
+            .find("\r\n\r\n")
+            .map(|start| &self.raw[start + 4..])
+    }
+
+    fn refreshes_session(self) -> bool {
+        !(self.path == "/state" || self.path == "/events") || self.query.contains("active=1")
+    }
+}
+
+/// Form-login + session-cookie only (no HTTP Basic Auth). Browsers cache Basic
+/// credentials and auto-resend them, which makes logout impossible. For `/state`
+/// and `/events`, refresh the idle TTL only when the page reports recent activity.
+async fn authenticate_request(
+    socket: &mut TcpSocket<'_>,
+    request: ParsedRequest<'_>,
+    auth_required: bool,
+    expected_token: &str,
+    token_seed: u64,
+) -> bool {
+    if !auth_required {
+        return true;
+    }
+    if validate_session(request.raw, request.refreshes_session()) {
+        return true;
+    }
+
+    handle_unauthenticated(socket, request, expected_token, token_seed).await;
+    false
+}
+
+async fn handle_unauthenticated(
+    socket: &mut TcpSocket<'_>,
+    request: ParsedRequest<'_>,
+    expected_token: &str,
+    token_seed: u64,
+) {
+    if request.method == "POST" && request.path == "/login" {
+        handle_login(socket, request, expected_token, token_seed).await;
+        return;
+    }
+
+    // EventSource must receive a bare 401 so it errors and lets polling take over.
+    if request.path == "/events" {
+        send_and_close(socket, HTTP_401_LOGIN).await;
+        return;
+    }
+
+    show_login_form(socket, request.raw).await;
+}
+
+async fn handle_login(
+    socket: &mut TcpSocket<'_>,
+    request: ParsedRequest<'_>,
+    expected_token: &str,
+    token_seed: u64,
+) {
+    let now = Instant::now().as_secs();
+    let fails = LOGIN_FAIL_COUNT.load(Ordering::Relaxed);
+    let last_fail = LOGIN_FAIL_LAST.load(Ordering::Relaxed) as u64;
+
+    if login_is_locked(now, fails, last_fail) {
+        warn!("WEB: login locked out ({} fails)", fails);
+        send_login_form(socket, HTTP_401_LOGIN, Some(LOGIN_LOCKED)).await;
+        return;
+    }
+
+    if fails >= LOGIN_MAX_FAILS {
+        LOGIN_FAIL_COUNT.store(0, Ordering::Relaxed);
+    }
+
+    if login_credentials_match(request, expected_token) {
+        complete_login(socket, token_seed).await;
+        return;
+    }
+
+    reject_login(socket).await;
+}
+
+fn login_is_locked(now: u64, fails: u32, last_fail: u64) -> bool {
+    fails >= LOGIN_MAX_FAILS && now.saturating_sub(last_fail) < LOGIN_LOCKOUT_SECS
+}
+
+fn login_credentials_match(request: ParsedRequest<'_>, expected_token: &str) -> bool {
+    let Some(body) = request.body() else {
+        return false;
+    };
+    let (Some(user), Some(pass)) = parse_login_form(body) else {
+        return false;
+    };
+    let submitted = jzf407_logic::auth::basic_token(user.as_str(), pass.as_str());
+    submitted.as_str() == expected_token
+}
+
+async fn complete_login(socket: &mut TcpSocket<'_>, token_seed: u64) {
+    LOGIN_FAIL_COUNT.store(0, Ordering::Relaxed);
+    let new_token = mint_session_token(token_seed.wrapping_add(Instant::now().as_secs()));
+    SESSION_TOKEN_HI.store((new_token >> 32) as u32, Ordering::Relaxed);
+    SESSION_TOKEN_LO.store(new_token as u32, Ordering::Relaxed);
+    SESSION_CREATED.store(Instant::now().as_secs() as u32, Ordering::Relaxed);
+
+    let mut redirect: HString<256> = HString::new();
+    let _ = core::fmt::Write::write_fmt(
+        &mut redirect,
+        format_args!(
+            "HTTP/1.1 303 See Other\r\nSet-Cookie: jzf_session={}; Path=/; Max-Age=1800; HttpOnly; SameSite=Strict\r\nLocation: /\r\nConnection: close\r\n\r\n",
+            new_token
+        ),
+    );
+    send_and_close(socket, redirect.as_str()).await;
+}
+
+async fn reject_login(socket: &mut TcpSocket<'_>) {
+    let new_fails = LOGIN_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    LOGIN_FAIL_LAST.store(Instant::now().as_secs() as u32, Ordering::Relaxed);
+    warn!("WEB: failed login attempt #{}", new_fails);
+
+    // Preserve the response delay that slows brute-force attempts.
+    Timer::after(Duration::from_millis(LOGIN_FAIL_DELAY_MS)).await;
+    let message = if new_fails >= LOGIN_MAX_FAILS {
+        LOGIN_LOCKED
+    } else {
+        LOGIN_ERROR
+    };
+    send_login_form(socket, HTTP_401_LOGIN, Some(message)).await;
+}
+
+async fn show_login_form(socket: &mut TcpSocket<'_>, req: &str) {
+    let status = if extract_cookie(req, "jzf_session").is_some() {
+        HTTP_401_EXPIRE_COOKIE
+    } else {
+        HTTP_401_LOGIN
+    };
+    send_login_form(socket, status, None).await;
+}
+
+async fn send_login_form(socket: &mut TcpSocket<'_>, status: &str, message: Option<&str>) {
+    w(socket, status).await;
+    w(socket, LOGIN_HEAD).await;
+    if let Some(message) = message {
+        w(socket, message).await;
+    }
+    w(socket, LOGIN_TAIL).await;
+    finish_response(socket).await;
+}
+
+async fn send_and_close(socket: &mut TcpSocket<'_>, response: &str) {
+    w(socket, response).await;
+    finish_response(socket).await;
+}
+
+async fn finish_response(socket: &mut TcpSocket<'_>) {
+    let _ = socket.flush().await;
+    socket.close();
+}
+
+async fn route_authenticated(
+    socket: &mut TcpSocket<'_>,
+    request: ParsedRequest<'_>,
+    cfg: &NetworkConfig,
+    stack: Stack<'static>,
+    reset_reason: ResetReason,
+) {
+    match (request.method, request.path) {
+        ("GET", "/") => serve_dashboard(socket, cfg, stack, reset_reason).await,
+        ("GET", "/events") => serve_event_stream(socket, stack).await,
+        ("GET", "/login") => send_and_close(socket, HTTP_303_HOME).await,
+        ("GET", "/state") => serve_state(socket, cfg, stack, reset_reason).await,
+        ("POST", "/logout") => log_out(socket).await,
+        ("POST", "/reboot") => reboot(socket).await,
+        ("POST", "/save") => save_and_reboot(socket, request, cfg).await,
+        _ => send_not_found(socket).await,
+    }
+}
+
+async fn serve_dashboard(
+    socket: &mut TcpSocket<'_>,
+    cfg: &NetworkConfig,
+    stack: Stack<'static>,
+    reset_reason: ResetReason,
+) {
+    send_page(socket, cfg, stack, reset_reason).await;
+    // Graceful FIN prevents ERR_CONNECTION_RESET in the live-state client.
+    socket.close();
+}
+
+async fn serve_event_stream(socket: &mut TcpSocket<'_>, stack: Stack<'static>) {
+    crate::sse::serve_events(socket, stack).await;
+    socket.close();
+}
+
+async fn serve_state(
+    socket: &mut TcpSocket<'_>,
+    cfg: &NetworkConfig,
+    stack: Stack<'static>,
+    reset_reason: ResetReason,
+) {
+    send_state(socket, cfg, stack, reset_reason).await;
+    socket.close();
+}
+
+async fn log_out(socket: &mut TcpSocket<'_>) {
+    SESSION_TOKEN_HI.store(0, Ordering::Relaxed);
+    SESSION_TOKEN_LO.store(0, Ordering::Relaxed);
+    SESSION_CREATED.store(0, Ordering::Relaxed);
+    info!("WEB: user logged out");
+    send_and_close(socket, HTTP_303_LOGOUT).await;
+}
+
+async fn reboot(socket: &mut TcpSocket<'_>) {
+    let _ = socket.write_all(HTTP_OK.as_bytes()).await;
+    let _ = socket
+        .write_all(b"<html><head><meta http-equiv=refresh content='4;url=/'></head><body><p>Rebooting... <a href=/>back in 4s</a></p></body></html>")
+        .await;
+    finish_response(socket).await;
+    Timer::after(Duration::from_millis(300)).await;
+    warn!("WEB: /reboot triggered sys_reset");
+    crate::fault_marker::safe_reboot();
+}
+
+async fn save_and_reboot(
+    socket: &mut TcpSocket<'_>,
+    request: ParsedRequest<'_>,
+    cfg: &NetworkConfig,
+) {
+    let Some(body) = request.body() else {
+        send_and_close(socket, HTTP_400).await;
+        return;
+    };
+    let Some(new_cfg) = parse_form(body, cfg) else {
+        send_and_close(socket, HTTP_400).await;
+        return;
+    };
+
+    if crate::config::save_config(&new_cfg).await.is_err() {
+        warn!("WEB: EEPROM save failed");
+        send_and_close(socket, HTTP_500).await;
+        return;
+    }
+
+    let _ = socket.write_all(HTTP_OK.as_bytes()).await;
+    let _ = socket
+        .write_all(b"<html><head><meta http-equiv=refresh content='4;url=/'></head><body><p>Saved. Rebooting... <a href=/>back in 4s</a></p></body></html>")
+        .await;
+    finish_response(socket).await;
+    Timer::after(Duration::from_millis(200)).await;
+    warn!("WEB: /save triggered sys_reset");
+    crate::fault_marker::safe_reboot();
+}
+
+async fn send_not_found(socket: &mut TcpSocket<'_>) {
+    let _ = socket.write_all(HTTP_404.as_bytes()).await;
+    socket.close();
 }
 
 fn parse_form(body: &str, current: &NetworkConfig) -> Option<NetworkConfig> {

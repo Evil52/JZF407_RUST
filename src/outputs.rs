@@ -62,6 +62,14 @@ pub struct OutputPins {
     pub relay: Output<'static>,
 }
 
+fn drive_active_low(output: &mut Output<'static>, on: bool) {
+    if on {
+        output.set_low();
+    } else {
+        output.set_high();
+    }
+}
+
 pub struct SharedOutputs {
     inner: Mutex<CriticalSectionRawMutex, Option<OutputPins>>,
 }
@@ -84,26 +92,17 @@ impl SharedOutputs {
     }
 
     pub fn set(&self, led: LedId, on: bool) {
-        if let Ok(mut g) = self.inner.try_lock() {
-            if let Some(ref mut p) = *g {
-                match led {
-                    LedId::Led1 => {
-                        if on {
-                            p.led1.set_low()
-                        } else {
-                            p.led1.set_high()
-                        }
-                    }
-                    LedId::Led2 => {
-                        if on {
-                            p.led2.set_low()
-                        } else {
-                            p.led2.set_high()
-                        }
-                    }
-                }
-            }
-        }
+        let Ok(mut guard) = self.inner.try_lock() else {
+            return;
+        };
+        let Some(pins) = guard.as_mut() else {
+            return;
+        };
+        let output = match led {
+            LedId::Led1 => &mut pins.led1,
+            LedId::Led2 => &mut pins.led2,
+        };
+        drive_active_low(output, on);
     }
 
     /// Callers must use [`pulse_relay`] / [`relay_off`] so timing stays owned

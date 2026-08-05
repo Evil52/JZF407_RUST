@@ -1,6 +1,8 @@
 /target
 logic/target
 /coverage-html
+/.scannerwork/
+/.sonar-reports/
 /geiger-report.txt
 /size-report.txt
 /version.txt
