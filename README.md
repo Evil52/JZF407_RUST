@@ -303,17 +303,19 @@ The `analyze` stage runs `cargo audit` (RustSec advisory DB) and `cargo deny`
 (SPDX license allow-list, banned sources — policy in [`deny.toml`](deny.toml));
 missing optional tools are reported as SKIP with an install hint, never FAIL.
 
-**GitHub CodeQL** — hosted Rust security scanning for the public repository:
+**GitHub Actions CI** — hosted quality and security checks for the public
+repository:
 
-- runs on pushes and pull requests targeting `master`, every Monday, and manually;
-- uses the `security-extended` query suite;
-- publishes findings under **Security and quality → Code scanning**.
+- [`rust-ci.yml`](.github/workflows/rust-ci.yml) runs formatting, embedded and
+  host Clippy, the firmware release build, host tests, and the 80% coverage gate;
+- [`codeql.yml`](.github/workflows/codeql.yml) runs Rust CodeQL with the
+  `security-extended` query suite and publishes findings under
+  **Security and quality → Code scanning**.
 
-The workflow is [`.github/workflows/codeql.yml`](.github/workflows/codeql.yml).
-Its buildless `none` mode is intentional for Rust CodeQL and is independent of
-the firmware build and host tests above. If GitHub-managed CodeQL Default setup
-is already enabled, switch the repository to Advanced setup before using this
-workflow.
+Both workflows run on pushes and pull requests targeting `master` and can be
+started manually; CodeQL also runs every Monday. Its buildless `none` mode is
+intentional for Rust. If GitHub-managed CodeQL Default setup is already enabled,
+switch the repository to Advanced setup before using the repository workflow.
 
 **Local SonarQube** — Community Build 26.7 with PostgreSQL, native Rust/Clippy
 analysis, LCOV import and a blocking Quality Gate:

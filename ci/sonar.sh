@@ -90,9 +90,9 @@ case "$ACTION" in
     mkdir -p target/sonar
 
     cargo fmt --all --check
-    cargo clippy --release --message-format=json -- --no-deps \
+    cargo clippy --release --message-format=json --no-deps \
       > target/sonar/clippy-firmware.json
-    cargo clippy -p jzf407-logic --target "$host_triple" --all-targets \
+    cargo clippy -p jzf407-logic --target "$host_triple" --all-targets --no-deps \
       --message-format=json > target/sonar/clippy-logic.json
     cargo llvm-cov -p jzf407-logic --target "$host_triple" \
       --lcov --output-path target/sonar/lcov.info --remap-path-prefix \
@@ -104,8 +104,8 @@ case "$ACTION" in
 
     # Upload reports before enforcing the local no-warning policy so any
     # findings remain visible in SonarQube even when this wrapper returns FAIL.
-    cargo clippy --release -- --no-deps -D warnings
-    cargo clippy -p jzf407-logic --target "$host_triple" --all-targets -- -D warnings
+    cargo clippy --release --no-deps -- -D warnings
+    cargo clippy -p jzf407-logic --target "$host_triple" --all-targets --no-deps -- -D warnings
     echo "Анализ завершён: $SONAR_URL/dashboard?id=jzf407-rust"
     ;;
   *)

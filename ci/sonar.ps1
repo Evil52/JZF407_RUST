@@ -122,11 +122,11 @@ switch ($Action) {
 
         Invoke-Checked "cargo" @("fmt", "--all", "--check")
         Write-ClippyReport -Arguments @(
-            "clippy", "--release", "--message-format=json", "--", "--no-deps"
+            "clippy", "--release", "--message-format=json", "--no-deps"
         ) -OutputPath (Join-Path $reportDir "clippy-firmware.json")
         Write-ClippyReport -Arguments @(
             "clippy", "-p", "jzf407-logic", "--target", $hostTriple,
-            "--all-targets", "--message-format=json"
+            "--all-targets", "--message-format=json", "--no-deps"
         ) -OutputPath (Join-Path $reportDir "clippy-logic.json")
         Invoke-Checked "cargo" @(
             "llvm-cov", "-p", "jzf407-logic", "--target", $hostTriple,
@@ -144,8 +144,8 @@ switch ($Action) {
 
         # Reports are uploaded first so findings remain visible in SonarQube;
         # these checks additionally keep the local no-warning policy blocking.
-        Invoke-Checked "cargo" @("clippy", "--release", "--", "--no-deps", "-D", "warnings")
-        Invoke-Checked "cargo" @("clippy", "-p", "jzf407-logic", "--target", $hostTriple, "--all-targets", "--", "-D", "warnings")
+        Invoke-Checked "cargo" @("clippy", "--release", "--no-deps", "--", "-D", "warnings")
+        Invoke-Checked "cargo" @("clippy", "-p", "jzf407-logic", "--target", $hostTriple, "--all-targets", "--no-deps", "--", "-D", "warnings")
         Write-Host "Analysis completed: $sonarUrl/dashboard?id=jzf407-rust"
     }
 }
