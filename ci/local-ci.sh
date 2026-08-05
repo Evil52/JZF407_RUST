@@ -107,8 +107,8 @@ st_lint() {
   # -D warnings: любой clippy warning = FAIL (эквивалент -Werror).
   # Два прохода: прошивка (thumbv7em из .cargo/config) + logic на host-триплете
   # (иначе host-тестовый код крейта не линтится вовсе).
-  cargo clippy --release -- --no-deps -D warnings || return 1
-  cargo clippy -p jzf407-logic --target "$HOST_TRIPLE" --all-targets -- -D warnings
+  cargo clippy --release --no-deps -- -D warnings || return 1
+  cargo clippy -p jzf407-logic --target "$HOST_TRIPLE" --all-targets --no-deps -- -D warnings
 }
 
 st_analyze() {

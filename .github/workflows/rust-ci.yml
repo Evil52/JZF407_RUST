@@ -1,0 +1,70 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Format, lint, test, build, coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Resolve host target
+        id: rust
+        shell: bash
+        run: echo "host=$(rustc -vV | sed -n 's/^host: //p')" >> "$GITHUB_OUTPUT"
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Build firmware
+        run: cargo build --release --locked
+
+      - name: Lint firmware
+        run: cargo clippy --release --locked --no-deps -- -D warnings
+
+      - name: Lint host logic
+        run: >-
+          cargo clippy -p jzf407-logic
+          --target "${{ steps.rust.outputs.host }}"
+          --all-targets --locked --no-deps -- -D warnings
+
+      - name: Run host tests
+        run: >-
+          cargo test -p jzf407-logic
+          --target "${{ steps.rust.outputs.host }}"
+          --all-targets --locked
+
+      - name: Install coverage tool
+        run: cargo install cargo-llvm-cov --version 0.8.6 --locked
+
+      - name: Enforce line coverage
+        run: >-
+          cargo llvm-cov -p jzf407-logic
+          --target "${{ steps.rust.outputs.host }}"
+          --summary-only
+          --ignore-filename-regex tests
+          --fail-under-lines 80
