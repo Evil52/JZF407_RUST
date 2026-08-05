@@ -275,19 +275,20 @@ override it (e.g. `DEFMT_LOG=info`) to reduce log volume.
 
 **Host unit tests** (pure logic, no hardware)
 
-```bash
-cargo test -p jzf407-logic --target aarch64-apple-darwin
+```powershell
+.\test.cmd
+.\test.cmd --test auth
 ```
 
-The `logic` crate has its own
-[`logic/.cargo/config.toml`](logic/.cargo/config.toml) so `cargo test` inside
-that directory also runs natively without the explicit `--target`.
-
-Or use the workspace alias (Apple Silicon):
+On macOS/Linux the equivalent wrapper is:
 
 ```bash
-cargo test-host
+./test.sh
+./test.sh --test auth
 ```
+
+Both wrappers detect the host triple and override the embedded default target
+from [`.cargo/config.toml`](.cargo/config.toml).
 
 **Local CI** — full pipeline on this machine (format → build → clippy `-D warnings`
 → supply-chain analyze → tests → coverage → size budget → docs → optional HIL):
@@ -301,6 +302,63 @@ ci/local-ci.sh --only lint  # a single stage
 The `analyze` stage runs `cargo audit` (RustSec advisory DB) and `cargo deny`
 (SPDX license allow-list, banned sources — policy in [`deny.toml`](deny.toml));
 missing optional tools are reported as SKIP with an install hint, never FAIL.
+
+**GitHub CodeQL** — hosted Rust security scanning for the public repository:
+
+- runs on pushes and pull requests targeting `master`, every Monday, and manually;
+- uses the `security-extended` query suite;
+- publishes findings under **Security and quality → Code scanning**.
+
+The workflow is [`.github/workflows/codeql.yml`](.github/workflows/codeql.yml).
+Its buildless `none` mode is intentional for Rust CodeQL and is independent of
+the firmware build and host tests above. If GitHub-managed CodeQL Default setup
+is already enabled, switch the repository to Advanced setup before using this
+workflow.
+
+**Local SonarQube** — Community Build 26.7 with PostgreSQL, native Rust/Clippy
+analysis, LCOV import and a blocking Quality Gate:
+
+Prerequisites are Docker Desktop/Engine with Compose v2, the official
+[SonarScanner CLI](https://docs.sonarsource.com/sonarqube-community-build/analyzing-source-code/scanners/sonarscanner)
+in `PATH`, and `cargo-llvm-cov`. Allocate at least 4 GB RAM and two CPU cores to
+Docker:
+
+```powershell
+cargo install cargo-llvm-cov --version 0.8.6 --locked
+.\ci\sonar.cmd up
+```
+
+Open <http://localhost:9000>, complete the initial `admin` / `admin` sign-in,
+and create an analysis token under **My Account → Security**. Then run:
+
+```powershell
+$env:SONAR_TOKEN = "<token>"
+.\ci\sonar.cmd scan
+.\ci\sonar.cmd down   # keeps database and analysis history
+# Explicit destructive cleanup:
+.\ci\sonar.cmd down -Volumes
+```
+
+macOS/Linux uses `bash ci/sonar.sh up|scan|down` and the same `SONAR_TOKEN`
+environment variable; `bash ci/sonar.sh down --volumes` is the explicit
+destructive cleanup command. The web UI is bound to `127.0.0.1` and is not
+published to the LAN. The scanner statically analyzes both `src/` and
+`logic/src/`; the wrappers import separate Clippy JSON reports for the embedded
+firmware target and the host-tested logic crate. Executable coverage is currently
+generated for `jzf407-logic`; hardware-bound firmware remains visible as
+uncovered code instead of being hidden with Sonar exclusions. The local coverage
+gate is 80% and [`sonar-project.properties`](sonar-project.properties) also waits
+for the server Quality Gate. Docker named volumes persist across ordinary
+`down`. Community Build tracks only the main branch, so the wrappers refuse to
+scan anything except the canonical `master`.
+
+On a native Linux Docker host, apply SonarQube's Elasticsearch limits before
+the first start (Docker Desktop manages its own Linux VM):
+
+```bash
+sudo sysctl -w vm.max_map_count=524288
+sudo sysctl -w fs.file-max=131072
+```
 
 ---
 

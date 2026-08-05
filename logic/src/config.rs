@@ -134,7 +134,7 @@ fn write_str(slot: &mut [u8], s: &str) {
 
 pub fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     let mut octets = [0u8; 4];
-    let mut parts = s.splitn(4, '.');
+    let mut parts = s.split('.');
     for o in &mut octets {
         *o = parts.next()?.parse::<u8>().ok()?;
     }
