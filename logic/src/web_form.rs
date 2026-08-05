@@ -38,6 +38,9 @@ pub fn form_url_decode<const N: usize>(s: &str) -> Result<String<N>, FormError> 
         }
     }
 
+    if bytes_out.contains(&0) {
+        return Err(FormError::InvalidEncoding);
+    }
     let decoded =
         core::str::from_utf8(bytes_out.as_slice()).map_err(|_| FormError::InvalidEncoding)?;
     String::try_from(decoded).map_err(|_| FormError::Capacity)

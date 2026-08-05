@@ -1,2 +1,6 @@
 /target
 logic/target
+/coverage-html
+/geiger-report.txt
+/size-report.txt
+/version.txt

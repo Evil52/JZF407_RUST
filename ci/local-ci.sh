@@ -5,7 +5,7 @@
 # Rust/Embassy-аналог CMSIS-пайплайна: те же стадии, инструменты экосистемы Rust.
 #
 # Стадии:
-#   version   — git describe → version.txt
+#   version   — git describe → target/ci/version.txt
 #   format    — cargo fmt --check (канон: rustfmt из пинов rust-toolchain)
 #   build     — cargo build --release (thumbv7em-none-eabihf)
 #   lint      — cargo clippy -D warnings: прошивка + host-крейт logic
@@ -13,7 +13,7 @@
 #               cargo-deny (лицензии SPDX / бан-лист / advisories),
 #               cargo-geiger (unsafe-метрики, информативно)
 #   test      — host unit-тесты logic-крейта (./test.sh)
-#   coverage  — cargo-llvm-cov по logic-крейту (HTML + summary)
+#   coverage  — cargo-llvm-cov по logic-крейту (HTML + LCOV + порог 80%)
 #   size      — Flash/RAM бюджет ELF (cargo-size / arm-none-eabi-size)
 #   docs      — cargo doc --no-deps
 #   hil       — ТОЛЬКО если плата на USB: прошивка probe-rs + verify,
@@ -44,6 +44,9 @@ BOOT_MARKER="${BOOT_MARKER:-JZF407VET6 booting}"
 HIL_RTT_TIMEOUT="${HIL_RTT_TIMEOUT:-20}"
 # Бюджеты Flash/RAM (информативные пороги; F407VET6: 512K flash, 128K RAM).
 FLASH_BUDGET_KB="${FLASH_BUDGET_KB:-400}"
+COVERAGE_MIN="${COVERAGE_MIN:-80}"
+REPORT_DIR="${REPORT_DIR:-target/ci}"
+SONAR_DIR="${SONAR_DIR:-target/sonar}"
 
 # --- Цвета / счётчики ------------------------------------------------------
 if [ -t 1 ]; then
@@ -83,9 +86,10 @@ skip_missing() { stage_skip "$1" "нет $2 — установи: cargo install 
 # ===========================================================================
 
 do_version() {
-  git describe --tags --always --dirty > version.txt 2>/dev/null \
-    || git rev-parse --short HEAD > version.txt
-  cat version.txt
+  mkdir -p "$REPORT_DIR"
+  git describe --tags --always --dirty > "$REPORT_DIR/version.txt" 2>/dev/null \
+    || git rev-parse --short HEAD > "$REPORT_DIR/version.txt"
+  cat "$REPORT_DIR/version.txt"
 }
 
 st_format() {
@@ -103,7 +107,7 @@ st_lint() {
   # -D warnings: любой clippy warning = FAIL (эквивалент -Werror).
   # Два прохода: прошивка (thumbv7em из .cargo/config) + logic на host-триплете
   # (иначе host-тестовый код крейта не линтится вовсе).
-  cargo clippy --release -- -D warnings || return 1
+  cargo clippy --release -- --no-deps -D warnings || return 1
   cargo clippy -p jzf407-logic --target "$HOST_TRIPLE" --all-targets -- -D warnings
 }
 
@@ -130,9 +134,10 @@ st_analyze() {
   fi
   if need cargo-geiger; then
     echo "--- cargo geiger (unsafe-метрики, информативно) ---"
+    mkdir -p "$REPORT_DIR"
     cargo geiger -p jzf407-logic --target "$HOST_TRIPLE" --output-format Ascii \
-      > geiger-report.txt 2>/dev/null || true
-    tail -5 geiger-report.txt 2>/dev/null || true
+      > "$REPORT_DIR/geiger-report.txt" 2>/dev/null || true
+    tail -5 "$REPORT_DIR/geiger-report.txt" 2>/dev/null || true
   fi
   [ "$ran" -eq 1 ] || skip_missing analyze "cargo-audit/cargo-deny" "cargo-audit cargo-deny"
 }
@@ -143,18 +148,23 @@ st_test() {
 
 st_coverage() {
   need cargo-llvm-cov || skip_missing coverage cargo-llvm-cov cargo-llvm-cov || return $?
-  mkdir -p coverage-html
+  mkdir -p "$REPORT_DIR/coverage-html" "$SONAR_DIR"
   cargo llvm-cov -p jzf407-logic --target "$HOST_TRIPLE" \
-    --html --output-dir coverage-html --summary-only 2>/dev/null \
-    || cargo llvm-cov -p jzf407-logic --target "$HOST_TRIPLE" --summary-only
+    --html --output-dir "$REPORT_DIR/coverage-html" --remap-path-prefix \
+    --ignore-filename-regex tests --fail-under-lines "$COVERAGE_MIN" || return 1
+  cargo llvm-cov report -p jzf407-logic --target "$HOST_TRIPLE" \
+    --lcov --output-path "$SONAR_DIR/lcov.info" --ignore-filename-regex tests || return 1
+  cargo llvm-cov report -p jzf407-logic --target "$HOST_TRIPLE" \
+    --summary-only --ignore-filename-regex tests
 }
 
 st_size() {
   # Flash/RAM бюджет: text+rodata+data → flash, data+bss → RAM.
   [ -f "$FW_ELF" ] || { echo "нет $FW_ELF — сначала стадия build"; return 1; }
   local size_tool=""
+  mkdir -p "$REPORT_DIR"
   if need cargo-size; then
-    cargo size --release -- -A | tee size-report.txt
+    cargo size --release -- -A | tee "$REPORT_DIR/size-report.txt"
   elif need arm-none-eabi-size; then
     size_tool=arm-none-eabi-size
   elif need size; then
@@ -163,11 +173,11 @@ st_size() {
     skip_missing size "cargo-size/arm-none-eabi-size" "cargo-binutils"; return $?
   fi
   if [ -n "$size_tool" ]; then
-    "$size_tool" "$FW_ELF" | tee size-report.txt
+    "$size_tool" "$FW_ELF" | tee "$REPORT_DIR/size-report.txt"
   fi
   # Информативный порог по flash (text+data из последней строки Berkeley-формата).
   local flash_kb
-  flash_kb=$(awk 'END { print int(($1 + $2) / 1024) }' < <(tail -1 size-report.txt | tr -s ' ')) || return 0
+  flash_kb=$(awk 'END { print int(($1 + $2) / 1024) }' < <(tail -1 "$REPORT_DIR/size-report.txt" | tr -s ' ')) || return 0
   if [ -n "${flash_kb:-}" ] && [ "$flash_kb" -gt "$FLASH_BUDGET_KB" ] 2>/dev/null; then
     echo "⚠️  flash ${flash_kb}KB > бюджета ${FLASH_BUDGET_KB}KB (информативно)"
   fi
@@ -258,12 +268,12 @@ else
   run_stage size       st_size
   run_stage docs       st_docs
 
-  if board_present; then
+  if [ "$RUN_HIL" -eq 1 ] && board_present; then
     run_stage hil st_hil
   elif [ "$RUN_HIL" -eq 1 ]; then
     stage_fail hil  # явно запросили --hil, но платы нет → FAIL
   else
-    stage_skip hil "плата не подключена"
+    stage_skip hil "не запрошен (добавьте --hil)"
   fi
 fi
 

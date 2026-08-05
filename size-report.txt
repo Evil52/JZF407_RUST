@@ -1,2 +1,0 @@
-   text	   data	    bss	    dec	    hex	filename
- 161000	    160	  43448	 204608	  31f40	target/thumbv7em-none-eabihf/release/jzf407vet6
