@@ -16,15 +16,20 @@ use rust_mqtt::{
         Client,
     },
     config::KeepAlive,
+    header::FixedHeader,
     types::{MqttBinary, MqttString, TopicFilter, TopicName},
     Bytes,
 };
 
-/// Relay state → mqtt_task publish. Deliberately NOT signalled from the MQTT
-/// receive path: the broker echoes our own publish back (we subscribe to that
-/// topic), which would loop forever.
+/// Relay-changed notification from buttons_task / web_task → mqtt_task, so the
+/// new state gets published to `stm32/relay`. Deliberately NOT signalled from
+/// the MQTT receive path (handle_event): the broker echoes our own publish back
+/// (we subscribe to that topic), which would loop forever. See handle_event.
 pub static RELAY_CHANGE: Signal<CriticalSectionRawMutex, bool> = Signal::new();
 
+/// True only while the MQTT client is connected to the broker. Set by mqtt_task,
+/// read by web_task for the live "MQTT" status indicator. Plain atomic — it is a
+/// single bool with no ordering requirements against other state.
 pub static MQTT_ONLINE: AtomicBool = AtomicBool::new(false);
 
 const MQTT_TOPIC_LED1: &str = "stm32/led/1";
@@ -37,6 +42,7 @@ const MQTT_TOPIC_STATUS: &str = "stm32/status";
 const MQTT_TOPIC_DIAG: &str = "stm32/diag";
 const MQTT_TOPIC_HEARTBEAT: &str = "stm32/heartbeat";
 const MQTT_TOPIC_PONG: &str = "stm32/pong";
+const MQTT_HEARTBEAT_INTERVAL_MS: u64 = 10_000;
 
 const SUBSCRIBE_TOPICS: &[&str] = &[
     MQTT_TOPIC_LED1,
@@ -68,8 +74,6 @@ pub async fn mqtt_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: 
         cfg.broker_port,
     );
 
-    const HB_INTERVAL_MS: u64 = 10_000;
-
     let diag_str = reset_reason.as_str();
 
     loop {
@@ -97,26 +101,7 @@ pub async fn mqtt_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: 
             .trim_end_matches('\0');
         let client_id = MqttString::from_str(client_id_str).ok();
 
-        let will_topic = TopicName::new(MqttString::from_str(MQTT_TOPIC_STATUS).unwrap()).unwrap();
-        let will_msg = MqttBinary::try_from(b"offline" as &[u8]).unwrap();
-        let will_opts = WillOptions::new(will_topic, will_msg).retain();
-
-        let mut connect_opts = ConnectOptions::new()
-            .clean_start()
-            .keep_alive(KeepAlive::Seconds(core::num::NonZero::new(120).unwrap()))
-            .will(will_opts);
-
-        // Credentials are sent in the CLEAR on port 1883 — see README.
-        if !cfg.mqtt_user.is_empty() {
-            if let Ok(u) = MqttString::from_str(cfg.mqtt_user.as_str()) {
-                connect_opts = connect_opts.user_name(u);
-            }
-        }
-        if !cfg.mqtt_pass.is_empty() {
-            if let Ok(p) = MqttBinary::try_from(cfg.mqtt_pass.as_bytes()) {
-                connect_opts = connect_opts.password(p);
-            }
-        }
+        let connect_opts = build_connect_options(&cfg);
 
         match client.connect(socket, &connect_opts, client_id).await {
             Ok(_) => {
@@ -130,81 +115,156 @@ pub async fn mqtt_task(stack: Stack<'static>, cfg: NetworkConfig, reset_reason: 
             }
         }
 
+        // Publish status=online (retained)
         let _ = publish_retained(&mut client, MQTT_TOPIC_STATUS, b"online").await;
+        // Publish diag (retained)
         let _ = publish_retained(&mut client, MQTT_TOPIC_DIAG, diag_str.as_bytes()).await;
 
-        // Fire-and-forget: subacks arrive in the poll loop below.
-        let sub_opts = SubscriptionOptions::new();
-        let mut sub_ok = true;
-        for &topic in SUBSCRIBE_TOPICS {
-            let tf = match TopicFilter::new(MqttString::from_str(topic).unwrap()) {
-                Some(tf) => tf,
-                None => continue,
-            };
-            if client.subscribe(tf, sub_opts).await.is_err() {
-                sub_ok = false;
-                break;
-            }
-        }
-        if !sub_ok {
+        if !subscribe_all(&mut client).await {
             warn!("MQTT: subscribe request failed");
+            MQTT_ONLINE.store(false, Ordering::Relaxed);
             Timer::after(Duration::from_secs(1)).await;
             continue;
         }
 
         info!("MQTT: subscribed to all topics");
 
-        let mut next_heartbeat =
-            embassy_time::Instant::now() + Duration::from_millis(HB_INTERVAL_MS);
+        run_connected_loop(&mut client).await;
 
-        loop {
-            let now = embassy_time::Instant::now();
-            if now >= next_heartbeat {
-                let _ = publish_qos0(&mut client, MQTT_TOPIC_HEARTBEAT, b"1").await;
-                next_heartbeat = now + Duration::from_millis(HB_INTERVAL_MS);
-            }
-
-            let hb_left = next_heartbeat.saturating_duration_since(embassy_time::Instant::now());
-            let timeout = hb_left.min(Duration::from_secs(1));
-
-            let result = embassy_futures::select::select3(
-                client.poll(),
-                RELAY_CHANGE.wait(),
-                Timer::after(timeout),
-            )
-            .await;
-
-            match result {
-                embassy_futures::select::Either3::First(Ok(event)) => {
-                    handle_event(&mut client, event).await;
-                }
-                embassy_futures::select::Either3::First(Err(e)) => {
-                    error!("MQTT: poll error {:?}", e);
-                    break;
-                }
-                embassy_futures::select::Either3::Second(relay_on) => {
-                    let payload = if relay_on { b"1" } else { b"0" };
-                    if publish_qos0(&mut client, MQTT_TOPIC_RELAY, payload)
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                embassy_futures::select::Either3::Third(_) => {
-                    if client.ping().await.is_err() {
-                        warn!("MQTT: ping failed");
-                        break;
-                    }
-                }
-            }
-        }
-
+        MQTT_ONLINE.store(false, Ordering::Relaxed);
         warn!("MQTT: disconnected, reconnecting in 1 s");
         Timer::after(Duration::from_secs(1)).await;
     }
 }
 
+fn build_connect_options(cfg: &NetworkConfig) -> ConnectOptions<'_> {
+    let will_topic = TopicName::new(MqttString::from_str(MQTT_TOPIC_STATUS).unwrap()).unwrap();
+    let will_msg = MqttBinary::try_from(b"offline" as &[u8]).unwrap();
+    let will_opts = WillOptions::new(will_topic, will_msg).retain();
+
+    // keep_alive = 120 s (broker timeout); the heartbeat below covers unreliable networks.
+    let mut options = ConnectOptions::new()
+        .clean_start()
+        .keep_alive(KeepAlive::Seconds(core::num::NonZero::new(120).unwrap()))
+        .will(will_opts);
+
+    // NOTE: credentials are sent in the CLEAR on port 1883 — see README.
+    if !cfg.mqtt_user.is_empty() {
+        if let Ok(user) = MqttString::from_str(cfg.mqtt_user.as_str()) {
+            options = options.user_name(user);
+        }
+    }
+    if !cfg.mqtt_pass.is_empty() {
+        if let Ok(password) = MqttBinary::try_from(cfg.mqtt_pass.as_bytes()) {
+            options = options.password(password);
+        }
+    }
+    options
+}
+
+async fn subscribe_all<'c, N, B>(client: &mut Client<'c, N, B, 8, 4, 4, 1>) -> bool
+where
+    N: rust_mqtt::io::Transport,
+    B: rust_mqtt::buffer::BufferProvider<'c>,
+{
+    let options = SubscriptionOptions::new();
+    for &topic in SUBSCRIBE_TOPICS {
+        let Some(filter) = TopicFilter::new(MqttString::from_str(topic).unwrap()) else {
+            continue;
+        };
+        if client.subscribe(filter, options).await.is_err() {
+            return false;
+        }
+        // Do NOT wait for Suback here — the poll loop processes every response.
+    }
+    true
+}
+
+async fn finish_polled_packet<'c, N, B>(
+    client: &mut Client<'c, N, B, 8, 4, 4, 1>,
+    header: FixedHeader,
+) -> bool
+where
+    N: rust_mqtt::io::Transport,
+    B: rust_mqtt::buffer::BufferProvider<'c>,
+{
+    match client.poll_body(header).await {
+        Ok(event) => {
+            handle_event(client, event).await;
+            true
+        }
+        Err(error) => {
+            error!("MQTT: poll error {:?}", error);
+            false
+        }
+    }
+}
+
+fn relay_payload(relay_on: bool) -> &'static [u8] {
+    if relay_on {
+        b"1"
+    } else {
+        b"0"
+    }
+}
+
+async fn run_connected_loop<'c, N, B>(client: &mut Client<'c, N, B, 8, 4, 4, 1>)
+where
+    N: rust_mqtt::io::Transport,
+    B: rust_mqtt::buffer::BufferProvider<'c>,
+{
+    let mut next_heartbeat =
+        embassy_time::Instant::now() + Duration::from_millis(MQTT_HEARTBEAT_INTERVAL_MS);
+
+    loop {
+        let now = embassy_time::Instant::now();
+        if now >= next_heartbeat {
+            let _ = publish_qos0(client, MQTT_TOPIC_HEARTBEAT, b"1").await;
+            next_heartbeat = now + Duration::from_millis(MQTT_HEARTBEAT_INTERVAL_MS);
+        }
+
+        let heartbeat_left = next_heartbeat.saturating_duration_since(embassy_time::Instant::now());
+        let timeout = heartbeat_left.min(Duration::from_secs(1));
+        let result = embassy_futures::select::select3(
+            // `poll()` is not cancel-safe. Selecting only its cancel-safe header
+            // phase lets relay/timer work preempt an idle read without abandoning
+            // a partially received MQTT packet; once a header arrives, the body
+            // is always consumed below.
+            client.poll_header(),
+            RELAY_CHANGE.wait(),
+            Timer::after(timeout),
+        )
+        .await;
+
+        match result {
+            embassy_futures::select::Either3::First(Ok(header)) => {
+                if !finish_polled_packet(client, header).await {
+                    return;
+                }
+            }
+            embassy_futures::select::Either3::First(Err(error)) => {
+                error!("MQTT: poll error {:?}", error);
+                return;
+            }
+            embassy_futures::select::Either3::Second(relay_on) => {
+                if publish_qos0(client, MQTT_TOPIC_RELAY, relay_payload(relay_on))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            embassy_futures::select::Either3::Third(_) => {
+                if client.ping().await.is_err() {
+                    warn!("MQTT: ping failed");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Process an incoming MQTT event. Needs &mut client for publishing pong responses.
 async fn handle_event<'c, N, B>(client: &mut Client<'c, N, B, 8, 4, 4, 1>, event: Event<'_, 1>)
 where
     N: rust_mqtt::io::Transport,
@@ -213,9 +273,8 @@ where
     let Event::Publish(pub_event) = event else {
         return;
     };
-    // Retained = stale broker-stored command replayed on every (re)subscribe;
-    // executing it would re-fire outputs after each reconnect. Live commands
-    // arrive with retain=false and are never dropped.
+    // A retained publication is a stale broker-stored command replayed after
+    // every subscribe. Executing it would re-fire outputs after reconnect.
     if pub_event.retain {
         return;
     }
@@ -224,7 +283,10 @@ where
 
     use jzf407_logic::led_dispatch::{dispatch, dispatch_special, OutputCmd};
 
-    if let Some(cmd) = dispatch(topic, payload).or_else(|| dispatch_special(topic)) {
+    if let Some(cmd) = dispatch(topic, payload).or_else(|| {
+        // For ping/reboot, payload is irrelevant
+        dispatch_special(topic)
+    }) {
         match cmd {
             OutputCmd::Led1(on) => {
                 crate::OUTPUTS.set(LedId::Led1, on);
@@ -240,8 +302,11 @@ where
                 crate::persistence::save_leds(on, on).await;
             }
             OutputCmd::Relay(on) => {
-                // Do NOT signal RELAY_CHANGE here: that publishes to stm32/relay,
-                // which the broker echoes back (we subscribe to it) — infinite loop.
+                // Relay is a momentary pulse: any truthy command fires a 2 s
+                // pulse, falsy cancels it. Timing is owned by relay_task. Do NOT
+                // signal RELAY_CHANGE here: that triggers a publish to
+                // stm32/relay, which the broker would echo back (we subscribe to
+                // it) and loop forever.
                 if on {
                     crate::outputs::pulse_relay()
                 } else {
@@ -249,6 +314,7 @@ where
                 }
             }
             OutputCmd::Ping => {
+                // Reply with pong for RTT measurement
                 let _ = publish_qos0(client, MQTT_TOPIC_PONG, b"1").await;
             }
             OutputCmd::Reboot => {
@@ -270,13 +336,7 @@ where
     N: rust_mqtt::io::Transport,
     B: rust_mqtt::buffer::BufferProvider<'c>,
 {
-    let topic_ref = TopicName::new(MqttString::from_str(topic).unwrap()).unwrap();
-    let pub_opts = PublicationOptions::new(TopicReference::Name(topic_ref));
-    client
-        .publish(&pub_opts, Bytes::from(payload))
-        .await
-        .map(|_| ())
-        .map_err(|_| ())
+    publish(client, topic, payload, false).await
 }
 
 async fn publish_retained<'c, N, B>(
@@ -288,10 +348,24 @@ where
     N: rust_mqtt::io::Transport,
     B: rust_mqtt::buffer::BufferProvider<'c>,
 {
+    publish(client, topic, payload, true).await
+}
+
+async fn publish<'c, N, B>(
+    client: &mut Client<'c, N, B, 8, 4, 4, 1>,
+    topic: &str,
+    payload: &[u8],
+    retained: bool,
+) -> Result<(), ()>
+where
+    N: rust_mqtt::io::Transport,
+    B: rust_mqtt::buffer::BufferProvider<'c>,
+{
     let topic_ref = TopicName::new(MqttString::from_str(topic).unwrap()).unwrap();
-    let pub_opts = PublicationOptions::new(TopicReference::Name(topic_ref)).retain();
+    let options = PublicationOptions::new(TopicReference::Name(topic_ref));
+    let options = if retained { options.retain() } else { options };
     client
-        .publish(&pub_opts, Bytes::from(payload))
+        .publish(&options, Bytes::from(payload))
         .await
         .map(|_| ())
         .map_err(|_| ())
